@@ -89,6 +89,24 @@ class ReleaseReadinessTests(unittest.TestCase):
                 self.assertIn(relative, readme)
                 self.assertTrue((ROOT / relative).is_file())
 
+    def test_public_roadmap_has_no_internal_codex_instruction(self) -> None:
+        roadmap = (ROOT / "docs" / "04_ロードマップ.md").read_text(
+            encoding="utf-8"
+        )
+        old_instruction = (
+            ROOT / "docs" / "Ver0.8.9_ロードマップ_Codex指示.md"
+        )
+        self.assertFalse(old_instruction.exists())
+        self.assertIn("Ver0.8.9　統合確認と安定化（完了）", roadmap)
+        self.assertIn("Ver1.0.0　初回リリース候補（公開前確認中）", roadmap)
+        self.assertIn("将来候補", roadmap)
+        for internal_phrase in (
+            "Codex実装指示",
+            "Codexへの実装指示",
+            "コミット指示",
+        ):
+            self.assertNotIn(internal_phrase, roadmap)
+
     def test_batch_launcher_uses_project_relative_venv(self) -> None:
         launcher = (ROOT / "run_metami.bat").read_text(
             encoding="utf-8"
@@ -161,6 +179,9 @@ class ReleaseReadinessTests(unittest.TestCase):
             if any(part in skipped_parts for part in path.parts):
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
+            if path == ROOT / "README.md":
+                # 公開セットアップ例の推奨インストール先だけを許可する。
+                text = text.replace("C:" + "\\METAMI", "")
             if drive_path.search(text) or secret_token.search(text):
                 problems.append(str(path.relative_to(ROOT)))
         self.assertEqual(problems, [])

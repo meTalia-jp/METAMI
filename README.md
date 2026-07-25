@@ -72,70 +72,148 @@ JPG/JPEGはEXIF Orientationがある場合、Qtの自動変換機能で表示方
 依存関係の導入、`python src\main.py`、`run_metami.bat`、対応形式の表示、
 タイトル・タグ・メモおよび初期レイアウトを確認しています。
 
-## セットアップ
+## セットアップと起動
 
-### 1. GitとPythonを用意する
+ここでは、WindowsでM.E.T.A.M.I.を初めて使う方を対象に、
+フォルダーを作るところから順番に説明します。
+
+途中で黒い画面の「コマンドプロンプト」を使いますが、入力する内容は
+すべて掲載しています。コマンドはまとめて入力せず、**上から1行ずつ**
+入力してください。1つの処理が終わり、入力できる状態へ戻ってから
+次の行へ進みます。
+
+### 初めてインストールする場合
+
+#### 手順1：GitとPythonをインストールする
+
+最初に、次の2つをインストールします。
 
 - [Git for Windows](https://git-scm.com/download/win)
 - [Python 3.12](https://www.python.org/downloads/)
 
-Pythonのインストール時は、必要に応じて`Add python.exe to PATH`を
-有効にしてください。
+Gitは、GitHubからM.E.T.A.M.I.をダウンロードするために使います。
+Pythonは、M.E.T.A.M.I.本体を動かすために使います。
 
-### 2. リポジトリを取得する
+Pythonのインストール画面では、`Add python.exe to PATH`へチェックを
+入れてください。インストールが終わったら、一度開いている画面を閉じます。
 
-GitHubの「Code」からリポジトリURLを取得して実行してください。
+#### 手順2：CドライブへMETAMIフォルダーを作る
 
-```powershell
-git clone <repository-url>
-cd METAMI
+M.E.T.A.M.I.を入れる場所は、次の場所を推奨します。
+
+```text
+C:\METAMI
 ```
 
-### 3. venvを作成して有効化する
+次の順番で、普段どおりエクスプローラーを操作します。
 
-Python Launcherを使用する場合:
+1. キーボードの`Windows`キーと`E`キーを同時に押します。
+2. エクスプローラーの左側にある「PC」または「このPC」をクリックします。
+3. 「ローカル ディスク（C:）」をダブルクリックします。
+4. Cドライブを開いて最初に表示された場所で、何もない部分を右クリックします。
+5. 「新規作成」→「フォルダー」をクリックします。
+6. フォルダー名を半角英字で`METAMI`にします。
+7. 作成した`METAMI`フォルダーをダブルクリックして開きます。
 
-```powershell
+フォルダー名には、日本語、空白、特殊な記号を使わないでください。
+`METAMI`という名前をそのまま使用するのが確実です。
+
+Cドライブへ作成できない場合は、「ドキュメント」など、自分が
+ファイルを保存できる場所へ`METAMI`フォルダーを作っても構いません。
+
+#### 手順3：METAMIフォルダーでコマンドプロンプトを開く
+
+1. `METAMI`フォルダーを開いたまま、エクスプローラー上部の
+   アドレスバーをクリックします。
+2. 表示されている文字を消し、半角英字で`cmd`と入力します。
+3. `Enter`キーを押します。
+
+黒いコマンドプロンプト画面が開きます。画面の最後が
+`METAMI>`のようになっていれば、正しいフォルダーを開けています。
+
+#### 手順4：M.E.T.A.M.I.をダウンロードする
+
+黒いコマンドプロンプト画面へ次の1行を入力し、`Enter`キーを押します。
+
+```cmd
+git clone https://github.com/meTalia-jp/METAMI.git .
+```
+
+最後の`.`も必要です。これは、現在開いている`METAMI`フォルダーの中へ
+ファイルを入れる、という意味です。
+
+文字が何行か表示され、再び入力できる状態になったらダウンロード完了です。
+
+#### 手順5：M.E.T.A.M.I.専用のPython環境を作る
+
+次の1行を入力し、`Enter`キーを押します。処理が終わるまで待ちます。
+
+```cmd
 py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
 ```
 
-`python`コマンドがPython 3.12を指している場合:
+この操作で作るvenv（仮想環境）は、M.E.T.A.M.I.に必要なものを
+ほかのPythonアプリと分けて保管するための専用環境です。
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+処理が終わったら、次の1行を入力します。
+
+```cmd
+.venv\Scripts\activate.bat
 ```
 
-PowerShellでスクリプト実行が拒否された場合は、現在のプロセスだけを
-対象に次を実行してから有効化してください。
+成功すると、入力する行の先頭に`(.venv)`と表示されます。
 
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\.venv\Scripts\Activate.ps1
+```text
+(.venv) METAMI>
 ```
 
-### 4. 依存パッケージを導入する
+#### 手順6：必要なパッケージをインストールする
 
-```powershell
+行頭に`(.venv)`と表示されていることを確認し、次の2行を
+上から1行ずつ実行します。
+
+```cmd
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-`requirements.txt`には実行に必要なPySide6だけを記載しています。
-SQLiteはPython標準ライブラリを使用するため、追加インストールは不要です。
+`pip`は、Pythonへ追加パッケージをインストールする仕組みです。
+M.E.T.A.M.I.では、画面表示に必要なPySide6をインストールします。
+SQLiteはPythonに含まれているため、別途インストールする必要はありません。
 
-## 起動
+#### 手順7：初めて起動する
 
-venvを有効化して起動:
+行頭に`(.venv)`と表示されている状態で、次の1行を実行します。
 
-```powershell
+```cmd
 python src/main.py
 ```
 
-または、エクスプローラーから`run_metami.bat`を実行します。
-`.venv`が存在しない場合やPySide6が未導入の場合は、セットアップ手順を
-日本語で案内します。
+M.E.T.A.M.I.の画面が表示されれば、インストールは完了です。
+アプリを閉じると、黒いコマンドプロンプト画面へ戻ります。
+
+### 2回目以降に起動する場合
+
+初回インストールが終わった後は、コマンドを入力する必要はありません。
+
+1. エクスプローラーで`METAMI`フォルダーを開きます。
+2. `run_metami.bat`をダブルクリックします。
+
+これだけでM.E.T.A.M.I.が起動します。
+
+`run_metami.bat`が見つからない場合は、別の`METAMI`フォルダーを
+開いていないか確認してください。
+
+### うまく進まない場合
+
+- 「`git`は認識されていません」と表示された場合：
+  Git for Windowsをインストールした後、コマンドプロンプトを開き直します。
+- 「`py`は認識されていません」と表示された場合：
+  Python 3.12を再インストールし、`Add python.exe to PATH`へチェックを入れます。
+- `(.venv)`が表示されない場合：
+  `.venv\Scripts\activate.bat`をもう一度実行します。
+- `run_metami.bat`で起動できない場合：
+  初回インストールの手順5と手順6が完了しているか確認します。
 
 ## 基本操作
 
@@ -186,7 +264,7 @@ data/metami.db
 
 venvを有効化した状態で実行します。
 
-```powershell
+```cmd
 python -m unittest discover -s tests -v
 ```
 
