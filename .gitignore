@@ -1,0 +1,78 @@
+# Python仮想環境
+/.venv/
+/venv/
+/env/
+
+# ローカルのバックアップと私物・動作確認用サンプル
+/bkup/
+/sample/
+
+# 旧配置へ誤って置かれたモックアップ
+/mockups/
+
+# 公開対象外のGUIモックアップとローカル旧ロードマップ
+/docs/mockups/*.png
+/docs/mockups/04_ロードマップ9.md
+
+# Pythonが生成するキャッシュ
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.tox/
+/.nox/
+/.coverage
+/htmlcov/
+
+# 一時確認用スクリプト
+/src/test_check.py
+
+# 実行時に生成されるユーザーデータ
+/data/*
+!/data/.gitkeep
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# ログ、出力、テスト生成物
+*.log
+/logs/
+/output/
+/outputs/
+/build/
+/dist/
+/.test_artifacts/
+/.ver*_check.png
+/.ver*_scale*.png
+/.ver*_focus.png
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# ユーザー固有設定・秘密情報
+.env
+.env.*
+!.env.example
+*.local.json
+*.local.toml
+*.local.yaml
+*.local.yml
+
+# IDE・エディター固有設定
+/.idea/
+/.vscode/
+*.code-workspace
+
+# OS固有ファイル
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
