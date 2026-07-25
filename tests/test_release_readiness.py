@@ -108,11 +108,16 @@ class ReleaseReadinessTests(unittest.TestCase):
             self.assertNotIn(internal_phrase, roadmap)
 
     def test_batch_launcher_uses_project_relative_venv(self) -> None:
-        launcher = (ROOT / "run_metami.bat").read_text(
-            encoding="utf-8"
-        )
+        launcher_path = ROOT / "run_metami.bat"
+        launcher_bytes = launcher_path.read_bytes()
+        self.assertFalse(launcher_bytes.startswith(b"\xef\xbb\xbf"))
+        launcher = launcher_bytes.decode("utf-8")
         self.assertIn("%~dp0.venv\\Scripts\\python.exe", launcher)
         self.assertIn('"%~dp0src\\main.py"', launcher)
+        self.assertIn("README.md", launcher)
+        self.assertIn("qt.multimedia.ffmpeg.info=false", launcher)
+        self.assertNotIn("Activate.ps1", launcher)
+        self.assertNotIn("PowerShell", launcher)
         self.assertNotRegex(launcher, r"\b[A-Za-z]:[\\/]")
 
     def test_runtime_and_private_paths_are_ignored(self) -> None:
