@@ -1,7 +1,6 @@
 # M.E.T.A.M.I.
 
 **読み方:** めたみ
-**正式名称:** Metadata Exploration & Tag Analysis with Media Insight
 **現在の状態:** Ver1.0.0 リリース候補
 
 M.E.T.A.M.I.は、画像・動画の内容と埋め込みメタデータを確認し、
@@ -11,20 +10,20 @@ M.E.T.A.M.I.は、画像・動画の内容と埋め込みメタデータを確�
 
 ![M.E.T.A.M.I. メイン画面](docs/images/metami-main.png)
 
-## 名称の由来
+## METAMIって何？
 
-代表的な名称展開は次のとおりです。
+M.E.T.A.M.I.は「めたみ」と読みます。
 
-> **M**etadata **E**xploration & **T**ag **A**nalysis with **M**edia **I**nsight
+英語でそれっぽく表すと、
 
-機能や使い方を別の角度から表す名称として、次の解釈も使用します。
+- Metadata Exploration & Tag Analysis with Media Insight
+- Media Explorer for Tags, Assets, Metadata, and Insights
 
-> **M**edia **E**xplorer for **T**ags, **A**ssets, **M**etadata, and **I**nsights
+あたりでしょうか。
 
-Media Explorer for Tags, Assets, Metadata, and Insights
-
-読み方は「めたみ」です。キャラクターのタリアとめたみが、素材探しと
-メタデータ整理を支援する構成になっています。
+厳密な正式名称というより、
+「画像や動画のメタデータを見て、整理して、楽しむアプリ」
+という雰囲気を名前に当てはめたものです。
 
 ## 主な機能
 
