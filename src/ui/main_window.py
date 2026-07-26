@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtCore import QSize, QTimer, Qt
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QPainter, QPen
 from PySide6.QtWidgets import (
+    QAbstractButton,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QLabel,
-    QMainWindow,
     QMessageBox,
-    QSplitter,
     QVBoxLayout,
     QWidget,
+    QMainWindow,
+    QSplitter,
 )
 
 from metadata.display_service import DisplayDataError, build_display_data
@@ -49,6 +53,122 @@ RATING_NUDGE_MESSAGES = (
     "めたみに感想を教えて",
     "★、ほしいかも",
 )
+RATING_PROMPT_MESSAGES = (
+    "この作品、どうだった？",
+    "気に入ったら★をつけてね",
+    "今日の出来はどう？",
+    "お気に入り度を教えてね",
+    "この作品、何点？",
+    "いいと思ったら星で評価",
+    "あなたの評価を聞かせて",
+    "また見たい作品かな？",
+    "ひらめき度を星で残そう",
+    "今回の仕上がりはどう？",
+)
+
+
+class ToggleSwitch(QAbstractButton):
+    """ONは右、OFFは左へノブが移動する小型トグル。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(42, 22)
+
+    def sizeHint(self) -> QSize:
+        return QSize(42, 22)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        track = self.rect().adjusted(1, 2, -1, -2)
+        checked = self.isChecked()
+        painter.setPen(
+            QPen(QColor("#303238" if checked else "#858a93"), 1)
+        )
+        painter.setBrush(QColor("#555960" if checked else "#c8cbd1"))
+        painter.drawRoundedRect(track, 10, 10)
+        knob_size = 16
+        knob_x = (
+            self.width() - knob_size - 4 if checked else 4
+        )
+        painter.setPen(QPen(QColor("#655b72"), 0.8))
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawEllipse(knob_x, 3, knob_size, knob_size)
+        painter.end()
+
+
+class DisplayTabSettingsDialog(QDialog):
+    """起動中だけ保持する任意タブの表示設定。"""
+
+    LABELS = (
+        ("ltx", "LTX"),
+        ("wan", "WAN"),
+        ("image_generation", "画像生成"),
+        ("workflow", "Workflow"),
+        ("json", "JSON全文"),
+    )
+
+    def __init__(
+        self, visibility: dict[str, bool], parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("表示タブの設定")
+        self.setModal(True)
+        self.setMinimumWidth(320)
+        self.toggles: dict[str, ToggleSwitch] = {}
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+        description = QLabel(
+            "詳細欄へ表示するタブを選んでください。\n"
+            "基本情報とタグ・メモは常に表示されます。"
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        for key, label in self.LABELS:
+            row = QWidget()
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(6, 1, 6, 1)
+            row_layout.setSpacing(2)
+            title = QLabel(label)
+            toggle = ToggleSwitch()
+            toggle.setObjectName(f"{key}TabToggle")
+            toggle.setChecked(visibility[key])
+            toggle.setAccessibleName(f"{label}タブを表示")
+            toggle.setToolTip("右: ON／左: OFF")
+            self.toggles[key] = toggle
+            line = QWidget()
+            line_layout = QVBoxLayout(line)
+            line_layout.setContentsMargins(0, 0, 0, 0)
+            line_layout.addWidget(title)
+            line_layout.addWidget(
+                toggle, 0, Qt.AlignmentFlag.AlignRight
+            )
+            row_layout.addWidget(line)
+            layout.addWidget(row)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.reset_button = buttons.addButton(
+            "タブ設定を初期状態に戻す",
+            QDialogButtonBox.ButtonRole.ResetRole,
+        )
+        self.reset_button.clicked.connect(self.reset_visibility)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def visibility(self) -> dict[str, bool]:
+        return {
+            key: toggle.isChecked() for key, toggle in self.toggles.items()
+        }
+
+    def reset_visibility(self) -> None:
+        for toggle in self.toggles.values():
+            toggle.setChecked(True)
 
 
 class MainWindow(QMainWindow):
@@ -65,6 +185,7 @@ class MainWindow(QMainWindow):
         self._current_path: Path | None = None
         self._ignore_next_file_signal = False
         self._rating_prompted_paths: set[str] = set()
+        self._rating_appeal_path_key = ""
         self._rating_prompt_pending = False
         self._rating_prompt_timer = QTimer(self)
         self._rating_prompt_timer.setSingleShot(True)
@@ -129,7 +250,7 @@ class MainWindow(QMainWindow):
         right_layout.setSpacing(8)
         self.right_character_header = AnalysisCharacterHeader(
             "めたみ",
-            "メタデータ解析・編集コンソール",
+            "メタデータ解析\n編集ツール",
             "metami.png",
             "right",
         )
@@ -143,6 +264,7 @@ class MainWindow(QMainWindow):
         self.rating_appeal = RatingAppealPanel(
             self.metadata_pane.rating_control
         )
+        self.rating_appeal.set_prompt(random.choice(RATING_PROMPT_MESSAGES))
         self.right_character_header.add_accessory(self.analysis_status)
         self.right_character_header.add_accessory(self.rating_appeal)
         right_layout.addWidget(self.right_character_header)
@@ -177,15 +299,59 @@ class MainWindow(QMainWindow):
 
     def _create_menus(self) -> None:
         file_menu = self.menuBar().addMenu("ファイル(&F)")
-        select_file = file_menu.addAction("ファイルを選択(&O)...")
+        self.file_menu = file_menu
+        select_file = file_menu.addAction("ファイルを開く(&O)...")
         select_file.triggered.connect(self._select_file)
-        select_folder = file_menu.addAction("フォルダを選択(&D)...")
+        select_folder = file_menu.addAction("フォルダを開く(&D)...")
         select_folder.triggered.connect(self._select_folder)
+        recent_folder = file_menu.addAction("最近開いたフォルダ")
+        recent_folder.setEnabled(False)
+        recent_folder.setToolTip("今後追加予定")
+        missing_items = file_menu.addAction("見つからない項目を確認・整理")
+        missing_items.setEnabled(False)
+        missing_items.setToolTip("今後追加予定")
         file_menu.addSeparator()
         exit_action = file_menu.addAction("終了(&X)")
         exit_action.triggered.connect(self.close)
-        self.menuBar().addMenu("表示(&V)")
-        self.menuBar().addMenu("ヘルプ(&H)")
+        view_menu = self.menuBar().addMenu("表示(&V)")
+        self.view_menu = view_menu
+        tab_settings = view_menu.addAction("表示タブの設定")
+        tab_settings.triggered.connect(self._show_display_tab_settings)
+        reset_tabs = view_menu.addAction("表示を初期状態に戻す")
+        reset_tabs.triggered.connect(self._reset_display_layout)
+        help_menu = self.menuBar().addMenu("ヘルプ(&H)")
+        self.help_menu = help_menu
+        about = help_menu.addAction("METAMIについて")
+        about.triggered.connect(self._show_about)
+        version = help_menu.addAction("バージョン情報")
+        version.triggered.connect(self._show_version)
+
+    def _show_display_tab_settings(self) -> None:
+        dialog = DisplayTabSettingsDialog(
+            self.metadata_pane.optional_tab_visibility(), self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        for key, visible in dialog.visibility().items():
+            self.metadata_pane.set_optional_tab_visible(key, visible)
+
+    def _reset_display_layout(self) -> None:
+        """ウィンドウ内容を保ったまま左右・上下分割だけを既定値へ戻す。"""
+        self.splitter.setSizes(PAGE_SPLITTER_SIZES)
+        self.detail_splitter.setSizes(DETAIL_SPLITTER_SIZES)
+
+    def _show_about(self) -> None:
+        QMessageBox.information(
+            self,
+            "METAMIについて",
+            "M.E.T.A.M.I.は、画像・動画のメタデータを確認し、"
+            "評価・タグ・メモで整理するアプリです。",
+        )
+
+    def _show_version(self) -> None:
+        QMessageBox.information(
+            self, "バージョン情報", "METAMI Ver1.0.0"
+        )
 
     def _select_file(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
@@ -461,6 +627,12 @@ class MainWindow(QMainWindow):
             return
         self._cancel_rating_nudge()
         self._current_path = path
+        path_key = self._path_key(path)
+        if path_key != self._rating_appeal_path_key:
+            self.rating_appeal.set_prompt(
+                random.choice(RATING_PROMPT_MESSAGES)
+            )
+            self._rating_appeal_path_key = path_key
         self.metadata_pane.set_rating(self.file_list_pane.get_rating(path))
         self.metadata_pane.set_tags(self.file_list_pane.get_tags(path))
         memo_error = ""

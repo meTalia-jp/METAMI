@@ -647,9 +647,17 @@ QPushButton:hover, QToolButton:hover {
     border-color: $lavender;
 }
 QToolButton#cardCopyButton {
-    background: #faf6ff;
-    border-color: #d5c4ef;
+    background: #f7f7f7;
+    border: 1px solid #777b82;
     padding: 3px;
+}
+QToolButton#cardCopyButton:hover {
+    background: #e1e3e6;
+    border-color: #44484e;
+}
+QToolButton#cardCopyButton:pressed {
+    background: #c8cbd0;
+    border-color: #25282d;
 }
 QToolButton#mediaButton {
     min-width: 28px;

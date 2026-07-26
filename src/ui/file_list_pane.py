@@ -573,7 +573,7 @@ class FileListPane(QWidget):
 
         self.character_header = CharacterHeader(
             "タリア",
-            "創作のひらめき・素材ブラウジング",
+            "創作のひらめき\n素材ブラウジング",
             "netami.png",
             "left",
         )

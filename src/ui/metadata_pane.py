@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from PySide6.QtCore import QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -105,6 +105,35 @@ class MetadataPane(QWidget):
         self.tabs.setIconSize(QSize(8, 8))
         self.tabs.tabBar().setUsesScrollButtons(True)
         self.tabs.tabBar().setExpanding(False)
+        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
+        for button in self.tabs.tabBar().findChildren(QToolButton):
+            if button.objectName() == "ScrollLeftButton":
+                button.setArrowType(Qt.ArrowType.NoArrow)
+                button.setIcon(_tab_scroll_icon("left"))
+                button.setToolTip("左のタブを表示")
+            elif button.objectName() == "ScrollRightButton":
+                button.setArrowType(Qt.ArrowType.NoArrow)
+                button.setIcon(_tab_scroll_icon("right"))
+                button.setToolTip("右のタブを表示")
+            else:
+                continue
+            button.setIconSize(QSize(12, 12))
+            button.setMinimumWidth(20)
+            button.setStyleSheet(
+                "QToolButton {"
+                " background: #ffffff;"
+                " border: 1px solid #303238;"
+                " border-radius: 3px;"
+                " padding: 0;"
+                " margin: 0;"
+                "}"
+                "QToolButton:hover { background: #e2e4e7; }"
+                "QToolButton:pressed { background: #c7cacf; }"
+                "QToolButton:disabled {"
+                " background: #eeeeee;"
+                " border-color: #777b82;"
+                "}"
+            )
         self.rating_control = RatingControl()
         self.rating_control.ratingChangeRequested.connect(
             self.ratingChangeRequested
@@ -117,26 +146,67 @@ class MetadataPane(QWidget):
         self.tag_editor.tagAddRequested.connect(self.tagAddRequested)
         self.tag_editor.tagRemoveRequested.connect(self.tagRemoveRequested)
         self.organizer_tab.saveRequested.connect(self.organizerSaveRequested)
+        self.ltx_tab = PlaceholderTab("LTX表示項目は調査中です")
+        self.wan_tab = PlaceholderTab("WAN対応は準備中です")
+        self.image_generation_tab = PlaceholderTab(
+            "画像生成用の表示項目は今後追加予定です"
+        )
         self.workflow_tab = TextTab("Workflowをコピー")
         self.json_tab = TextTab("JSON全文をコピー")
         self.tabs.addTab(self.overview_tab, "基本情報")
         self.tabs.addTab(self.organizer_tab, "タグ・メモ")
+        self.tabs.addTab(self.ltx_tab, "LTX")
+        self.tabs.addTab(self.wan_tab, "WAN")
+        self.tabs.addTab(self.image_generation_tab, "画像生成")
         self.tabs.addTab(self.workflow_tab, "Workflow")
         self.tabs.addTab(self.json_tab, "JSON全文")
-        self.tabs.setTabIcon(0, QIcon(tab_pixmap("#e9defc")))
-        self.tabs.setTabIcon(1, QIcon(tab_pixmap("#f3d8ea")))
-        self.tabs.setTabIcon(2, QIcon(tab_pixmap("#f7dfaa")))
-        self.tabs.setTabIcon(3, QIcon(tab_pixmap("#cfe8df")))
-        self.tabs.setTabToolTip(0, "基本情報")
-        self.tabs.setTabToolTip(1, "タグ・メモ")
-        self.tabs.setTabToolTip(2, "Workflow")
-        self.tabs.setTabToolTip(3, "JSON")
+        colors = (
+            "#e9defc",
+            "#f3d8ea",
+            "#f7dfaa",
+            "#d7dde8",
+            "#f4d9c7",
+            "#cfe8df",
+            "#d9e1f3",
+        )
+        for index, color in enumerate(colors):
+            self.tabs.setTabIcon(index, QIcon(tab_pixmap(color)))
+        for index in range(self.tabs.count()):
+            self.tabs.setTabToolTip(index, self.tabs.tabText(index))
+        wan_index = self.tabs.indexOf(self.wan_tab)
+        self.tabs.setTabEnabled(wan_index, False)
+        self.tabs.setTabToolTip(wan_index, "WAN対応は準備中です")
+        self._optional_tabs = {
+            "ltx": self.ltx_tab,
+            "wan": self.wan_tab,
+            "image_generation": self.image_generation_tab,
+            "workflow": self.workflow_tab,
+            "json": self.json_tab,
+        }
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self.tabs, 1)
         self.clear()
+
+    def optional_tab_visibility(self) -> dict[str, bool]:
+        return {
+            key: self.tabs.isTabVisible(self.tabs.indexOf(widget))
+            for key, widget in self._optional_tabs.items()
+        }
+
+    def set_optional_tab_visible(self, key: str, visible: bool) -> None:
+        widget = self._optional_tabs[key]
+        index = self.tabs.indexOf(widget)
+        self.tabs.setTabVisible(index, visible)
+        if self.tabs.currentWidget() is widget and not visible:
+            self.tabs.setCurrentWidget(self.overview_tab)
+
+    def reset_optional_tabs(self) -> None:
+        for key in self._optional_tabs:
+            self.set_optional_tab_visible(key, True)
+        self.tabs.setTabEnabled(self.tabs.indexOf(self.wan_tab), False)
 
     def set_data(self, data: DisplayData) -> None:
         self.overview_tab.set_data(data)
@@ -204,6 +274,22 @@ class MetadataPane(QWidget):
         self.set_tags([], False)
         self.set_user_title("", False)
         self.set_memo("", False)
+
+
+class PlaceholderTab(QWidget):
+    """将来機能の予定を短文だけで示す仮タブ。"""
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        label = QLabel(message)
+        label.setObjectName("placeholderTabMessage")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.addStretch(1)
+        layout.addWidget(label)
+        layout.addStretch(1)
 
 
 class OverviewTab(QScrollArea):
@@ -612,6 +698,7 @@ class TextTab(QWidget):
         self.editor.setReadOnly(True)
         self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.copy_button = QToolButton()
+        self.copy_button.setObjectName("cardCopyButton")
         self.copy_button.setIcon(_copy_icon())
         self.copy_button.setToolTip(copy_tooltip)
         self.copy_button.setAccessibleName(copy_tooltip)
@@ -789,3 +876,26 @@ def _copy_icon() -> QIcon:
     painter.drawRoundedRect(7, 6, 10, 11, 1.5, 1.5)
     painter.end()
     return QIcon(pixmap)
+
+
+def _tab_scroll_icon(direction: str) -> QIcon:
+    """アプリのQSSに埋もれない濃色三角アイコンを返す。"""
+    pixmap = QPixmap(14, 14)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#17191d"))
+    points = (
+        QPolygon([QPoint(10, 2), QPoint(4, 7), QPoint(10, 12)])
+        if direction == "left"
+        else QPolygon([QPoint(4, 2), QPoint(10, 7), QPoint(4, 12)])
+    )
+    painter.drawPolygon(points)
+    painter.end()
+    icon = QIcon()
+    icon.addPixmap(pixmap, QIcon.Mode.Normal, QIcon.State.Off)
+    icon.addPixmap(pixmap, QIcon.Mode.Disabled, QIcon.State.Off)
+    icon.addPixmap(pixmap, QIcon.Mode.Active, QIcon.State.Off)
+    icon.addPixmap(pixmap, QIcon.Mode.Selected, QIcon.State.Off)
+    return icon

@@ -204,7 +204,7 @@ class RatingAppealPanel(QWidget):
         self.prompt_label.setObjectName("ratingAppealText")
         self.prompt_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.prompt_label.setStyleSheet(
-            "color: #f1f3f7; background: transparent; font-size: 8pt;"
+            "color: #f1f3f7; background: transparent; font-size: 9pt;"
         )
         for label in rating_control.findChildren(QLabel):
             label.setStyleSheet(
@@ -237,6 +237,11 @@ class RatingAppealPanel(QWidget):
         self.nudge_label.setToolTip(message)
         self.nudge_label.show()
         self.updateGeometry()
+
+    def set_prompt(self, message: str) -> None:
+        """作品選択中に固定表示する評価前メッセージを更新する。"""
+        self.prompt_label.setText(message)
+        self.prompt_label.setToolTip(message)
 
     def clear_nudge(self) -> None:
         self.nudge_label.clear()
