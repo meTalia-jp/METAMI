@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import random
 from pathlib import Path
 
-from PySide6.QtCore import QSize, QTimer, Qt
+from PySide6.QtCore import QSettings, QSize, QTimer, Qt
 from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -21,6 +22,11 @@ from PySide6.QtWidgets import (
 )
 
 from metadata.display_service import DisplayDataError, build_display_data
+from metadata.media_finder import (
+    MediaSearchError,
+    SUPPORTED_SUFFIXES,
+    find_media_files,
+)
 from storage.database import DatabaseError, MetadataDatabase
 from ui.file_list_pane import FileListPane
 from ui.decorations import (
@@ -44,7 +50,9 @@ from ui.styles import (
 
 
 APP_TITLE = "M.E.T.A.M.I."
-SUPPORTED_SUFFIXES = {".png", ".webp", ".jpg", ".jpeg", ".mp4"}
+RECENT_FOLDERS_KEY = "folders/recent"
+INCLUDE_SUBFOLDERS_KEY = "folders/includeSubfolders"
+MAX_RECENT_FOLDERS = 5
 RATING_IMAGE_DELAY_MS = 18_000
 RATING_RETRY_DELAY_MS = 1_500
 RATING_NUDGE_MESSAGES = (
@@ -179,10 +187,17 @@ class MainWindow(QMainWindow):
         self,
         database: MetadataDatabase | None = None,
         database_error: str = "",
+        settings: QSettings | None = None,
     ) -> None:
         super().__init__()
         self.database = database
         self.database_error = database_error
+        self.settings = settings or QSettings("meTalia-jp", "METAMI")
+        self._recent_folders = self._load_recent_folders()
+        self._include_subfolders = self._setting_bool(
+            INCLUDE_SUBFOLDERS_KEY, False
+        )
+        self._current_folder: Path | None = None
         self._current_path: Path | None = None
         self._ignore_next_file_signal = False
         self._rating_prompted_paths: set[str] = set()
@@ -308,9 +323,17 @@ class MainWindow(QMainWindow):
         select_file.triggered.connect(self._select_file)
         select_folder = file_menu.addAction("フォルダを開く(&D)...")
         select_folder.triggered.connect(self._select_folder)
-        recent_folder = file_menu.addAction("最近開いたフォルダ")
-        recent_folder.setEnabled(False)
-        recent_folder.setToolTip("今後追加予定")
+        self.recent_folders_menu = file_menu.addMenu("最近開いたフォルダ")
+        self._refresh_recent_folders_menu()
+        file_menu.addSeparator()
+        self.include_subfolders_action = file_menu.addAction(
+            "サブフォルダも含む"
+        )
+        self.include_subfolders_action.setCheckable(True)
+        self.include_subfolders_action.setChecked(self._include_subfolders)
+        self.include_subfolders_action.toggled.connect(
+            self._set_include_subfolders
+        )
         missing_items = file_menu.addAction("見つからない項目を確認・整理")
         missing_items.setEnabled(False)
         missing_items.setToolTip("今後追加予定")
@@ -358,7 +381,7 @@ class MainWindow(QMainWindow):
 
     def _show_version(self) -> None:
         QMessageBox.information(
-            self, "バージョン情報", "METAMI Ver1.0.2"
+            self, "バージョン情報", "METAMI Ver1.0.3"
         )
 
     def _show_ltx_video_tips(self) -> None:
@@ -381,7 +404,7 @@ class MainWindow(QMainWindow):
     def _select_folder(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "フォルダを選択")
         if selected:
-            self._accept_path(Path(selected))
+            self._open_folder(Path(selected))
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         mime_data = event.mimeData()
@@ -417,32 +440,152 @@ class MainWindow(QMainWindow):
             event.ignore()
 
     def _accept_path(self, path: Path) -> None:
-        if not self._resolve_unsaved_memo():
-            return
         if path.is_file():
+            if not self._resolve_unsaved_memo():
+                return
+            self._current_folder = None
             self._set_paths([path])
             return
-        try:
-            paths = sorted(
-                (
-                    item
-                    for item in path.iterdir()
-                    if item.is_file() and item.suffix.lower() in SUPPORTED_SUFFIXES
-                ),
-                key=lambda item: item.name.casefold(),
+        self._open_folder(path)
+
+    def _open_folder(
+        self,
+        path: Path,
+        *,
+        add_to_history: bool = True,
+        resolve_unsaved: bool = True,
+    ) -> bool:
+        """既存の一覧更新経路を使ってフォルダを開く。"""
+        if not path.exists() or not path.is_dir():
+            self._set_status(
+                "指定されたフォルダが見つかりません。"
+                "履歴からは削除していません。",
+                "error",
             )
-        except OSError:
+            return False
+        if resolve_unsaved and not self._resolve_unsaved_memo():
+            return False
+        try:
+            result = find_media_files(
+                path, include_subfolders=self._include_subfolders
+            )
+        except MediaSearchError:
             self._show_input_error(
                 "フォルダを読み取れませんでした。アクセス権を確認してください。"
             )
-            return
-        display_paths = self._set_paths(paths, source_directory=path)
+            return False
+        self._current_folder = path
+        if add_to_history:
+            self._record_recent_folder(path)
+        display_paths = self._set_paths(
+            list(result.paths), source_directory=path
+        )
         if not display_paths:
             self.preview_pane.clear(
                 "対応するPNG、WEBP、JPG/JPEG、MP4がありません。"
             )
             self.metadata_pane.clear()
-            self._set_status(f"対象ファイル 0件: {path.resolve()}", "ready")
+            if result.unreadable_directories:
+                self._set_status(
+                    "対象ファイル 0件"
+                    "（一部のフォルダを読み取れませんでした）",
+                    "error",
+                )
+            else:
+                self._set_status(
+                    f"対象ファイル 0件: {path.resolve()}", "ready"
+                )
+        elif result.unreadable_directories:
+            self._set_status(
+                f"対象ファイル {len(display_paths)}件"
+                "（一部のフォルダを読み取れませんでした）",
+                "error",
+            )
+        return True
+
+    @staticmethod
+    def _folder_key(path: str | Path) -> str:
+        return os.path.normcase(
+            os.path.normpath(os.path.abspath(path))
+        ).casefold()
+
+    def _setting_bool(self, key: str, default: bool) -> bool:
+        value = self.settings.value(key, default)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().casefold() in {"1", "true", "yes", "on"}
+
+    def _load_recent_folders(self) -> list[str]:
+        value = self.settings.value(RECENT_FOLDERS_KEY, [])
+        if isinstance(value, str):
+            values = [value] if value else []
+        else:
+            values = [str(item) for item in (value or [])]
+        unique: list[str] = []
+        keys: set[str] = set()
+        for item in values:
+            key = self._folder_key(item)
+            if key not in keys:
+                keys.add(key)
+                unique.append(os.path.normpath(item))
+        return unique[:MAX_RECENT_FOLDERS]
+
+    def _record_recent_folder(self, path: Path) -> None:
+        display_path = os.path.normpath(os.path.abspath(path))
+        key = self._folder_key(display_path)
+        self._recent_folders = [
+            item
+            for item in self._recent_folders
+            if self._folder_key(item) != key
+        ]
+        self._recent_folders.insert(0, display_path)
+        del self._recent_folders[MAX_RECENT_FOLDERS:]
+        self.settings.setValue(RECENT_FOLDERS_KEY, self._recent_folders)
+        self.settings.sync()
+        self._refresh_recent_folders_menu()
+
+    def _refresh_recent_folders_menu(self) -> None:
+        menu = self.recent_folders_menu
+        menu.clear()
+        if not self._recent_folders:
+            empty = menu.addAction("履歴はありません")
+            empty.setEnabled(False)
+        else:
+            for folder in self._recent_folders:
+                action = menu.addAction(folder)
+                action.setToolTip(folder)
+                action.setStatusTip(folder)
+                action.triggered.connect(
+                    lambda checked=False, folder=folder:
+                    self._open_folder(Path(folder))
+                )
+        menu.addSeparator()
+        clear_action = menu.addAction("履歴を消去")
+        clear_action.setEnabled(bool(self._recent_folders))
+        clear_action.triggered.connect(self._clear_recent_folders)
+
+    def _clear_recent_folders(self) -> None:
+        self._recent_folders.clear()
+        self.settings.remove(RECENT_FOLDERS_KEY)
+        self.settings.sync()
+        self._refresh_recent_folders_menu()
+
+    def _set_include_subfolders(self, enabled: bool) -> None:
+        previous = self._include_subfolders
+        if self._current_folder is not None and not self._resolve_unsaved_memo():
+            self.include_subfolders_action.blockSignals(True)
+            self.include_subfolders_action.setChecked(previous)
+            self.include_subfolders_action.blockSignals(False)
+            return
+        self._include_subfolders = enabled
+        self.settings.setValue(INCLUDE_SUBFOLDERS_KEY, enabled)
+        self.settings.sync()
+        if self._current_folder is not None:
+            self._open_folder(
+                self._current_folder,
+                add_to_history=False,
+                resolve_unsaved=False,
+            )
 
     def _set_paths(
         self, paths: list[Path], source_directory: Path | None = None
@@ -508,6 +651,7 @@ class MainWindow(QMainWindow):
                 self._set_database_state("error")
         self.file_list_pane.set_paths(
             display_paths,
+            source_directory=source_directory,
             ratings=ratings,
             tags_by_path=tags_by_path,
             all_tags=all_tags,

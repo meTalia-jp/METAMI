@@ -168,6 +168,7 @@ class FileCard(StickyNoteFrame):
         missing: bool = False,
         memo: str = "",
         user_title: str = "",
+        relative_hint: str = "",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -224,6 +225,10 @@ class FileCard(StickyNoteFrame):
         name_row.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
 
         self._available_details = self._file_details(path)
+        if relative_hint:
+            self._available_details = (
+                f"場所: {relative_hint}\n{self._available_details}"
+            )
         self.details = QLabel(self._available_details)
         self.details.setObjectName("cardDetails")
         self.details.setWordWrap(True)
@@ -821,6 +826,7 @@ class FileListPane(QWidget):
         self,
         paths: list[Path],
         select_first: bool = True,
+        source_directory: Path | None = None,
         ratings: dict[str, int] | None = None,
         tags_by_path: dict[str, list[str]] | None = None,
         all_tags: list[str] | None = None,
@@ -831,6 +837,7 @@ class FileListPane(QWidget):
         missing_paths: set[str] | None = None,
     ) -> None:
         self._all_paths = list(paths)
+        self._source_directory = source_directory
         self._ratings = dict(ratings or {})
         self._tags_by_path = {
             path.casefold(): {tag.casefold(): tag for tag in tags}
@@ -881,12 +888,27 @@ class FileListPane(QWidget):
         self._cancel_video_thumbnails()
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
+        name_counts: dict[str, int] = {}
+        for path in paths:
+            key = path.name.casefold()
+            name_counts[key] = name_counts.get(key, 0) + 1
         for path in paths:
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, str(path))
             item.setToolTip(str(path))
             item.setSizeHint(QSize(CARD_WIDTH, CARD_HEIGHT))
             key = self._path_key(path)
+            relative_hint = ""
+            if (
+                self._source_directory is not None
+                and name_counts[path.name.casefold()] > 1
+            ):
+                try:
+                    relative_hint = str(
+                        path.relative_to(self._source_directory)
+                    )
+                except ValueError:
+                    relative_hint = str(path)
             card = FileCard(
                 path,
                 self._ratings.get(key, 0),
@@ -895,6 +917,7 @@ class FileListPane(QWidget):
                 key in self._missing_paths,
                 memo=self._memos_by_path.get(key, ""),
                 user_title=self._titles_by_path.get(key, ""),
+                relative_hint=relative_hint,
             )
             card.activated.connect(
                 lambda item=item: self.list_widget.setCurrentItem(item)

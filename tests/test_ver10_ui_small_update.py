@@ -97,7 +97,7 @@ class Ver10UiSmallUpdateTests(unittest.TestCase):
             finally:
                 self._close(window)
 
-    def test_menus_and_disabled_future_actions(self) -> None:
+    def test_menus_and_future_actions(self) -> None:
         window = MainWindow(None)
         try:
             file_menu = window.file_menu
@@ -109,12 +109,18 @@ class Ver10UiSmallUpdateTests(unittest.TestCase):
             }
             self.assertIn("ファイルを開く(O)...", file_actions)
             self.assertIn("フォルダを開く(D)...", file_actions)
-            for label in (
-                "最近開いたフォルダ",
-                "見つからない項目を確認・整理",
-            ):
-                self.assertFalse(file_actions[label].isEnabled())
-                self.assertEqual(file_actions[label].toolTip(), "今後追加予定")
+            self.assertTrue(file_actions["最近開いたフォルダ"].isEnabled())
+            self.assertIsNotNone(file_actions["最近開いたフォルダ"].menu())
+            self.assertTrue(
+                file_actions["サブフォルダも含む"].isCheckable()
+            )
+            self.assertFalse(
+                file_actions["見つからない項目を確認・整理"].isEnabled()
+            )
+            self.assertEqual(
+                file_actions["見つからない項目を確認・整理"].toolTip(),
+                "今後追加予定",
+            )
             view_actions = [
                 action.text() for action in window.view_menu.actions()
             ]
