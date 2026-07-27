@@ -36,6 +36,8 @@ class Mp4Info:
     duration_seconds: float | None
     width: int | None
     height: int | None
+    fps: float | None
+    frame_count: int | None
     metadata: tuple[tuple[str, str], ...]
 
 
@@ -84,7 +86,7 @@ def read_mp4_info(path: Path) -> Mp4Info:
             raise Mp4ReadError("MP4に必要な形式情報がありません。")
 
         duration = _read_duration(moov_data)
-        width, height = _read_video_dimensions(moov_data)
+        width, height, fps, frame_count = _read_video_track_info(moov_data)
         metadata = _read_metadata(moov_data)
         return Mp4Info(
             file_size=file_size,
@@ -93,6 +95,8 @@ def read_mp4_info(path: Path) -> Mp4Info:
             duration_seconds=duration,
             width=width,
             height=height,
+            fps=fps,
+            frame_count=frame_count,
             metadata=tuple(metadata),
         )
     except Mp4ReadError:
@@ -161,7 +165,9 @@ def _read_duration(moov: bytes) -> float | None:
     return duration / timescale if timescale else None
 
 
-def _read_video_dimensions(moov: bytes) -> tuple[int | None, int | None]:
+def _read_video_track_info(
+    moov: bytes,
+) -> tuple[int | None, int | None, float | None, int | None]:
     for trak in (box for box in _iter_boxes(moov) if box.box_type == b"trak"):
         children = list(_iter_boxes(moov, trak.payload_start, trak.end))
         tkhd = next((box for box in children if box.box_type == b"tkhd"), None)
@@ -183,8 +189,89 @@ def _read_video_dimensions(moov: bytes) -> tuple[int | None, int | None]:
         if tkhd.end - tkhd.payload_start < 8:
             raise Mp4ReadError("MP4の映像サイズ情報が不足しています。")
         width_fixed, height_fixed = struct.unpack_from(">II", moov, tkhd.end - 8)
-        return width_fixed >> 16, height_fixed >> 16
+        width, height = width_fixed >> 16, height_fixed >> 16
+        timescale, media_duration = _read_media_duration(moov, mdia)
+        frame_count, timing_duration = _read_sample_timing(moov, mdia)
+        duration_units = timing_duration or media_duration
+        fps = (
+            frame_count * timescale / duration_units
+            if frame_count is not None and timescale and duration_units
+            else None
+        )
+        return width, height, fps, frame_count
+    return None, None, None, None
+
+
+def _read_media_duration(data: bytes, mdia: _Box) -> tuple[int | None, int | None]:
+    mdhd = next(
+        (
+            box
+            for box in _iter_boxes(data, mdia.payload_start, mdia.end)
+            if box.box_type == b"mdhd"
+        ),
+        None,
+    )
+    if mdhd is None:
+        return None, None
+    payload = data[mdhd.payload_start : mdhd.end]
+    if len(payload) < 20:
+        return None, None
+    if payload[0] == 0:
+        return struct.unpack_from(">II", payload, 12)
+    if payload[0] == 1 and len(payload) >= 32:
+        timescale = struct.unpack_from(">I", payload, 20)[0]
+        duration = struct.unpack_from(">Q", payload, 24)[0]
+        return timescale, duration
     return None, None
+
+
+def _read_sample_timing(
+    data: bytes, mdia: _Box
+) -> tuple[int | None, int | None]:
+    mdia_children = list(_iter_boxes(data, mdia.payload_start, mdia.end))
+    minf = next((box for box in mdia_children if box.box_type == b"minf"), None)
+    if minf is None:
+        return None, None
+    stbl = next(
+        (
+            box
+            for box in _iter_boxes(data, minf.payload_start, minf.end)
+            if box.box_type == b"stbl"
+        ),
+        None,
+    )
+    if stbl is None:
+        return None, None
+    children = list(_iter_boxes(data, stbl.payload_start, stbl.end))
+    stts = next((box for box in children if box.box_type == b"stts"), None)
+    stsz = next((box for box in children if box.box_type == b"stsz"), None)
+    frame_count: int | None = None
+    timing_count: int | None = None
+    timing_duration: int | None = None
+    if stsz is not None:
+        payload = data[stsz.payload_start : stsz.end]
+        if len(payload) >= 12:
+            frame_count = struct.unpack_from(">I", payload, 8)[0]
+    if stts is not None:
+        payload = data[stts.payload_start : stts.end]
+        if len(payload) >= 8:
+            entry_count = struct.unpack_from(">I", payload, 4)[0]
+            offset = 8
+            total_count = 0
+            total_duration = 0
+            for _index in range(entry_count):
+                if len(payload) - offset < 8:
+                    break
+                count, delta = struct.unpack_from(">II", payload, offset)
+                total_count += count
+                total_duration += count * delta
+                offset += 8
+            if offset == 8 + entry_count * 8:
+                timing_count = total_count
+                timing_duration = total_duration
+    if frame_count is None:
+        frame_count = timing_count
+    return frame_count, timing_duration
 
 
 def _read_metadata(moov: bytes) -> list[tuple[str, str]]:

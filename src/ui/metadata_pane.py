@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from models.display_data import DisplayData
+from models.display_data import DisplayData, LtxDisplayData
 from ui.decorations import tab_pixmap
 
 
@@ -94,6 +94,7 @@ class MetadataPane(QWidget):
     tagAddRequested = Signal(str)
     tagRemoveRequested = Signal(str)
     organizerSaveRequested = Signal(str, str)
+    notificationRequested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -146,7 +147,8 @@ class MetadataPane(QWidget):
         self.tag_editor.tagAddRequested.connect(self.tagAddRequested)
         self.tag_editor.tagRemoveRequested.connect(self.tagRemoveRequested)
         self.organizer_tab.saveRequested.connect(self.organizerSaveRequested)
-        self.ltx_tab = PlaceholderTab("LTX表示項目は調査中です")
+        self.ltx_tab = LtxTab()
+        self.ltx_tab.notificationRequested.connect(self.notificationRequested)
         self.wan_tab = PlaceholderTab("WAN対応は準備中です")
         self.image_generation_tab = PlaceholderTab(
             "画像生成用の表示項目は今後追加予定です"
@@ -210,6 +212,7 @@ class MetadataPane(QWidget):
 
     def set_data(self, data: DisplayData) -> None:
         self.overview_tab.set_data(data)
+        self.ltx_tab.set_data(data.ltx)
         self.workflow_tab.set_text(data.workflow_text)
         self.json_tab.set_text(data.json_text)
 
@@ -263,17 +266,324 @@ class MetadataPane(QWidget):
 
     def show_error(self, message: str) -> None:
         self.overview_tab.show_error(message)
+        self.ltx_tab.clear()
         self.workflow_tab.set_text("Workflow情報を表示できません。")
         self.json_tab.set_text("メタデータを表示できません。")
 
     def clear(self) -> None:
         self.overview_tab.clear()
+        self.ltx_tab.clear()
         self.workflow_tab.set_text("Workflow情報はありません。")
         self.json_tab.set_text("メタデータはありません。")
         self.set_rating(0, False)
         self.set_tags([], False)
         self.set_user_title("", False)
         self.set_memo("", False)
+
+
+class LtxTab(QScrollArea):
+    """LTX 2.3の主要な生成条件を、人が読める形で表示する。"""
+
+    notificationRequested = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("ltxDetail")
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._prompt = ""
+        self._negative_prompt = ""
+        self._seed = ""
+
+        self.content = QWidget()
+        self.content.setObjectName("paperPage")
+        self.layout = QVBoxLayout(self.content)
+        self.layout.setContentsMargins(9, 9, 9, 9)
+        self.layout.setSpacing(9)
+        self.message = QLabel()
+        self.message.setObjectName("placeholderTabMessage")
+        self.message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.message.setWordWrap(True)
+        self.layout.addWidget(self.message)
+
+        self.prompt_card = QFrame()
+        self.prompt_card.setObjectName("infoCard")
+        prompt_heading = QLabel("プロンプト情報")
+        prompt_heading.setObjectName("cardHeading")
+
+        prompt_label = QLabel("プロンプト")
+        prompt_label.setObjectName("fieldName")
+        self.prompt_copy = QToolButton()
+        self.prompt_copy.setObjectName("cardCopyButton")
+        self.prompt_copy.setIcon(_copy_icon())
+        self.prompt_copy.setToolTip("プロンプトをコピー")
+        self.prompt_copy.clicked.connect(self._copy_prompt)
+        prompt_header = QHBoxLayout()
+        prompt_header.addWidget(prompt_label)
+        prompt_header.addStretch(1)
+        prompt_header.addWidget(self.prompt_copy)
+        self.prompt_label = WrappingValueLabel("")
+        self.prompt_label.setObjectName("fieldValue")
+        self.prompt_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+
+        negative_label = QLabel("ネガティブプロンプト")
+        negative_label.setObjectName("fieldName")
+        self.negative_prompt_copy = QToolButton()
+        self.negative_prompt_copy.setObjectName("cardCopyButton")
+        self.negative_prompt_copy.setIcon(_copy_icon())
+        self.negative_prompt_copy.setToolTip("ネガティブプロンプトをコピー")
+        self.negative_prompt_copy.clicked.connect(self._copy_negative_prompt)
+        negative_header = QHBoxLayout()
+        negative_header.addWidget(negative_label)
+        negative_header.addStretch(1)
+        negative_header.addWidget(self.negative_prompt_copy)
+        self.negative_prompt_label = WrappingValueLabel("")
+        self.negative_prompt_label.setObjectName("fieldValue")
+        self.negative_prompt_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        negative_note = QLabel(
+            "※サブグラフ内から抽出した情報です。"
+            "生成への適用状態は判定していません。"
+        )
+        negative_note.setObjectName("tagHelp")
+        negative_note.setWordWrap(True)
+
+        prompt_layout = QVBoxLayout(self.prompt_card)
+        prompt_layout.setContentsMargins(10, 7, 10, 9)
+        prompt_layout.setSpacing(5)
+        prompt_layout.addWidget(prompt_heading)
+        prompt_layout.addLayout(prompt_header)
+        prompt_layout.addWidget(self.prompt_label)
+        prompt_layout.addLayout(negative_header)
+        prompt_layout.addWidget(self.negative_prompt_label)
+        prompt_layout.addWidget(negative_note)
+
+        self.enhance_card = InfoCard("Prompt Enhance")
+        self.generation_card = InfoCard("生成設定", 3)
+        self.finished_card = InfoCard("完成動画", 2)
+        self.model_card = InfoCard("モデル情報", 3)
+
+        self.seed_card = QFrame()
+        self.seed_card.setObjectName("infoCard")
+        seed_heading = QLabel("Seed")
+        seed_heading.setObjectName("cardHeading")
+        self.seed_label = QLabel("情報なし")
+        self.seed_label.setObjectName("fieldValue")
+        self.seed_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.seed_copy = QToolButton()
+        self.seed_copy.setObjectName("cardCopyButton")
+        self.seed_copy.setIcon(_copy_icon())
+        self.seed_copy.setToolTip("主Seedをコピー")
+        self.seed_copy.clicked.connect(self._copy_seed)
+        seed_layout = QHBoxLayout(self.seed_card)
+        seed_layout.setContentsMargins(10, 7, 10, 9)
+        seed_layout.addWidget(seed_heading)
+        seed_layout.addWidget(self.seed_label, 1)
+        seed_layout.addWidget(self.seed_copy)
+
+        self.details_button = QToolButton()
+        self.details_button.setText("モデル詳細を表示")
+        self.details_button.setCheckable(True)
+        self.details_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self.details_button.setArrowType(Qt.ArrowType.RightArrow)
+        self.details_button.toggled.connect(self._toggle_details)
+        self.details_card = InfoCard("モデル詳細", 2)
+        self.details_card.setVisible(False)
+
+        for widget in (
+            self.prompt_card,
+            self.enhance_card,
+            self.generation_card,
+            self.seed_card,
+            self.finished_card,
+            self.model_card,
+            self.details_button,
+            self.details_card,
+        ):
+            self.layout.addWidget(widget)
+        self.layout.addStretch(1)
+        self.setWidget(self.content)
+        self.clear()
+
+    def set_data(self, data: LtxDisplayData | None) -> None:
+        detected = data is not None and data.detected
+        self.message.setVisible(not detected)
+        self.message.setText("LTX 2.3の生成情報を確認できません")
+        for widget in (
+            self.prompt_card,
+            self.enhance_card,
+            self.generation_card,
+            self.seed_card,
+            self.finished_card,
+            self.model_card,
+            self.details_button,
+            self.details_card,
+        ):
+            widget.setVisible(detected)
+        if not detected or data is None:
+            self._prompt = ""
+            self._negative_prompt = ""
+            self._seed = ""
+            return
+
+        self._prompt = data.prompt_text or ""
+        self._negative_prompt = data.negative_prompt or ""
+        self.prompt_label.setText(self._prompt or "保存情報なし")
+        self.prompt_copy.setEnabled(bool(self._prompt))
+        self.negative_prompt_label.setText(
+            self._negative_prompt or "保存情報なし"
+        )
+        self.negative_prompt_copy.setEnabled(bool(self._negative_prompt))
+        enhance = (
+            "ON"
+            if data.prompt_enhance_enabled is True
+            else "OFF"
+            if data.prompt_enhance_enabled is False
+            else "情報なし"
+        )
+        enhance_items = [("Prompt Enhance", enhance)]
+        if data.prompt_enhance_enabled is True:
+            enhance_items.append(
+                ("補足", "拡張後の文章は動画メタデータに保存されていません")
+            )
+        self.enhance_card.set_items(enhance_items)
+        self.generation_card.set_items(
+            (
+                ("生成設定サイズ", _format_dimensions(
+                    data.configured_width, data.configured_height
+                )),
+                ("秒数", _format_number(data.configured_duration, "秒")),
+                ("FPS", _format_number(data.configured_fps, "fps")),
+                (
+                    "フレーム数",
+                    f"{data.configured_frame_count}フレーム相当"
+                    if data.configured_frame_count is not None
+                    else "情報なし",
+                ),
+            )
+        )
+        self._seed = str(data.main_seed) if data.main_seed is not None else ""
+        self.seed_label.setText(self._seed or "情報なし")
+        self.seed_copy.setEnabled(bool(self._seed))
+
+        finished = [
+            ("実際の解像度", _format_dimensions(data.actual_width, data.actual_height)),
+            ("実際の再生時間", _format_number(data.actual_duration, "秒", 2)),
+            ("実際のFPS", _format_number(data.actual_fps, "fps", 3)),
+            (
+                "実際のフレーム数",
+                f"{data.actual_frame_count}フレーム"
+                if data.actual_frame_count is not None
+                else "情報なし",
+            ),
+        ]
+        if (
+            None not in (
+                data.configured_width,
+                data.configured_height,
+                data.actual_width,
+                data.actual_height,
+            )
+            and (data.configured_width, data.configured_height)
+            != (data.actual_width, data.actual_height)
+        ):
+            finished.append(
+                (
+                    "解像度について",
+                    "32の倍数条件に合わせて自動調整されたようです",
+                )
+            )
+        finished.append(
+            (
+                "時間・フレームについて",
+                "LTXの内部条件に合わせて調整されることがあります",
+            )
+        )
+        self.finished_card.set_items(finished)
+        self.model_card.set_items(
+            (
+                ("Checkpoint", data.checkpoint or "情報なし"),
+                ("Sampler", data.sampler or "情報なし"),
+                ("CFG", _format_number(data.cfg)),
+            )
+        )
+        self.details_card.set_items(
+            (
+                ("Distilled LoRA", data.distilled_lora or "情報なし"),
+                (
+                    "Distilled LoRA強度",
+                    _format_number(data.distilled_lora_strength),
+                ),
+                ("Text Encoder", data.text_encoder or "情報なし"),
+                ("Latent Upscaler", data.latent_upscaler or "情報なし"),
+                ("Prompt Enhance用LoRA", data.enhance_lora or "情報なし"),
+                (
+                    "Enhance LoRA Model強度",
+                    _format_number(data.enhance_lora_model_strength),
+                ),
+                (
+                    "Enhance LoRA CLIP強度",
+                    _format_number(data.enhance_lora_clip_strength),
+                ),
+                (
+                    "第2Seed",
+                    str(data.secondary_seed)
+                    if data.secondary_seed is not None
+                    else "情報なし",
+                ),
+            )
+        )
+        self._toggle_details(self.details_button.isChecked())
+
+    def clear(self) -> None:
+        self.details_button.setChecked(False)
+        self.set_data(None)
+
+    def _copy_prompt(self) -> None:
+        QApplication.clipboard().setText(self._prompt)
+        self.notificationRequested.emit("プロンプトをコピーしました")
+
+    def _copy_negative_prompt(self) -> None:
+        QApplication.clipboard().setText(self._negative_prompt)
+        self.notificationRequested.emit(
+            "ネガティブプロンプトをコピーしました"
+        )
+
+    def _copy_seed(self) -> None:
+        QApplication.clipboard().setText(self._seed)
+        self.notificationRequested.emit("Seedをコピーしました")
+
+    def _toggle_details(self, expanded: bool) -> None:
+        self.details_button.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self.details_button.setText(
+            "モデル詳細を閉じる" if expanded else "モデル詳細を表示"
+        )
+        self.details_card.setVisible(expanded and self.message.isHidden())
+
+
+def _format_dimensions(width: int | None, height: int | None) -> str:
+    return f"{width} × {height}" if width is not None and height is not None else "情報なし"
+
+
+def _format_number(
+    value: int | float | None, suffix: str = "", decimals: int | None = None
+) -> str:
+    if value is None:
+        return "情報なし"
+    if decimals is None:
+        rendered = f"{value:g}" if isinstance(value, float) else str(value)
+    else:
+        rendered = f"{value:.{decimals}f}".rstrip("0").rstrip(".")
+    return f"{rendered}{suffix}"
 
 
 class PlaceholderTab(QWidget):

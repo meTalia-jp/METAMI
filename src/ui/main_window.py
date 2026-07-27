@@ -217,6 +217,9 @@ class MainWindow(QMainWindow):
         self.metadata_pane.organizerSaveRequested.connect(
             self._save_current_organizer
         )
+        self.metadata_pane.notificationRequested.connect(
+            lambda message: self._set_status(message, "active")
+        )
         self.preview_pane.mediaError.connect(
             lambda message: self._set_status(message, "error")
         )
@@ -350,7 +353,7 @@ class MainWindow(QMainWindow):
 
     def _show_version(self) -> None:
         QMessageBox.information(
-            self, "バージョン情報", "METAMI Ver1.0.0"
+            self, "バージョン情報", "METAMI Ver1.0.1"
         )
 
     def _select_file(self) -> None:

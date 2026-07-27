@@ -171,7 +171,7 @@ class Ver10UiSmallUpdateTests(unittest.TestCase):
                 window.metadata_pane.ltx_tab.findChild(
                     type(window.status_icon), "placeholderTabMessage"
                 ).text(),
-                "LTX表示項目は調査中です",
+                "LTX 2.3の生成情報を確認できません",
             )
             wan_index = tabs.indexOf(window.metadata_pane.wan_tab)
             self.assertFalse(tabs.isTabEnabled(wan_index))

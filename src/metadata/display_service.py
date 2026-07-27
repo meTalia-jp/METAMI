@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from metadata.image_reader import ImageReadError, read_oriented_image
+from metadata.ltx_reader import read_ltx_info
 from metadata.mp4_reader import Mp4ReadError, read_mp4_info
 from metadata.png_reader import PngMetadataError, read_png_dimensions, read_png_metadata
 from metadata.webp_reader import WebpReadError, read_webp_info
@@ -44,6 +45,7 @@ def build_display_data(path: Path) -> DisplayData:
             ("ファイルサイズ", _format_file_size(stat.st_size)),
         ]
         raw_metadata: list[tuple[str, Any]]
+        ltx = None
         suffix = path.suffix.lower()
 
         if suffix == ".png":
@@ -92,6 +94,14 @@ def build_display_data(path: Path) -> DisplayData:
                 )
             )
             raw_metadata = [(key, _parse_json(value)) for key, value in info.metadata]
+            ltx = read_ltx_info(
+                raw_metadata,
+                actual_width=info.width,
+                actual_height=info.height,
+                actual_duration=info.duration_seconds,
+                actual_fps=info.fps,
+                actual_frame_count=info.frame_count,
+            )
         else:
             raise DisplayDataError("このファイル形式には対応していません。")
 
@@ -113,6 +123,7 @@ def build_display_data(path: Path) -> DisplayData:
             json_text=json_text,
             metadata_count=count,
             status=status,
+            ltx=ltx,
         )
     except DisplayDataError:
         raise
