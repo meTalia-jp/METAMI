@@ -27,6 +27,7 @@ from ui.decorations import (
     status_pixmap,
 )
 from ui.metadata_pane import MetadataPane
+from ui.ltx_video_tips_dialog import LtxVideoTipsDialog
 from ui.preview_pane import PreviewPane
 from ui.surface_widgets import (
     AnalysisCharacterHeader,
@@ -328,6 +329,10 @@ class MainWindow(QMainWindow):
         about.triggered.connect(self._show_about)
         version = help_menu.addAction("バージョン情報")
         version.triggered.connect(self._show_version)
+        creation_notes = help_menu.addMenu("作成メモ")
+        self.creation_notes_menu = creation_notes
+        ltx_video_tips = creation_notes.addAction("LTX動画作成メモ")
+        ltx_video_tips.triggered.connect(self._show_ltx_video_tips)
 
     def _show_display_tab_settings(self) -> None:
         dialog = DisplayTabSettingsDialog(
@@ -353,8 +358,12 @@ class MainWindow(QMainWindow):
 
     def _show_version(self) -> None:
         QMessageBox.information(
-            self, "バージョン情報", "METAMI Ver1.0.1"
+            self, "バージョン情報", "METAMI Ver1.0.2"
         )
+
+    def _show_ltx_video_tips(self) -> None:
+        dialog = LtxVideoTipsDialog(self)
+        dialog.exec()
 
     def _select_file(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(

@@ -126,7 +126,15 @@ class Ver10UiSmallUpdateTests(unittest.TestCase):
                 action.text() for action in window.help_menu.actions()
             ]
             self.assertEqual(
-                help_actions, ["METAMIについて", "バージョン情報"]
+                help_actions,
+                ["METAMIについて", "バージョン情報", "作成メモ"],
+            )
+            self.assertEqual(
+                [
+                    action.text()
+                    for action in window.creation_notes_menu.actions()
+                ],
+                ["LTX動画作成メモ"],
             )
         finally:
             self._close(window)

@@ -55,7 +55,7 @@ class ReleaseReadinessTests(unittest.TestCase):
             "JSON",
             "ユーザータイトル",
             "ライセンス",
-            "Ver1.0.1",
+            "Ver1.0.2",
             "Media Explorer for Tags, Assets, Metadata, and Insights",
             "Copyright (c) 2026 meTalia-jp",
             "英語UI",
