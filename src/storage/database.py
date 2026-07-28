@@ -30,6 +30,21 @@ class MissingFileDetails:
     has_memo: bool
 
 
+@dataclass(frozen=True)
+class RegisteredFileRecord:
+    """存在確認画面へ渡す、DBから読み取っただけの登録情報。"""
+
+    file_id: int
+    path: str
+    filename: str
+    format_name: str
+    size_bytes: int
+    created_at: str
+    rating: int
+    tags: tuple[str, ...]
+    memo: str
+
+
 class MetadataDatabase:
     """単一SQLiteファイルの初期化とファイル識別情報を管理する。"""
 
@@ -175,6 +190,51 @@ class MetadataDatabase:
         except sqlite3.Error as error:
             raise DatabaseError(
                 f"ファイル状態を読み込めません: {error}"
+            ) from error
+
+    def get_registered_file_records(self) -> list[RegisteredFileRecord]:
+        """DBを更新せず、存在確認に必要な登録情報をすべて返す。"""
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT files.id, files.canonical_path, files.filename,
+                           files.format_name, files.size_bytes,
+                           files.created_at, COALESCE(user_info.rating, 0),
+                           COALESCE(user_info.memo, '')
+                    FROM files
+                    LEFT JOIN user_info ON user_info.file_id = files.id
+                    ORDER BY files.canonical_path COLLATE NOCASE, files.id
+                    """
+                ).fetchall()
+                tag_rows = connection.execute(
+                    """
+                    SELECT file_tags.file_id, tags.name
+                    FROM file_tags
+                    JOIN tags ON tags.id = file_tags.tag_id
+                    ORDER BY tags.name COLLATE NOCASE
+                    """
+                ).fetchall()
+            tags_by_id: dict[int, list[str]] = {}
+            for file_id, tag_name in tag_rows:
+                tags_by_id.setdefault(int(file_id), []).append(str(tag_name))
+            return [
+                RegisteredFileRecord(
+                    file_id=int(row[0]),
+                    path=str(row[1] or ""),
+                    filename=str(row[2] or ""),
+                    format_name=str(row[3] or ""),
+                    size_bytes=int(row[4] or 0),
+                    created_at=str(row[5] or ""),
+                    rating=int(row[6] or 0),
+                    tags=tuple(tags_by_id.get(int(row[0]), [])),
+                    memo=str(row[7] or ""),
+                )
+                for row in rows
+            ]
+        except sqlite3.Error as error:
+            raise DatabaseError(
+                f"登録ファイル情報を読み込めません: {error}"
             ) from error
 
     def get_missing_file_details(self, path: Path) -> MissingFileDetails:

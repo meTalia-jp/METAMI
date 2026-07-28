@@ -33,6 +33,7 @@ from ui.decorations import (
     status_pixmap,
 )
 from ui.metadata_pane import MetadataPane
+from ui.missing_items_dialog import MissingItemsDialog
 from ui.ltx_video_tips_dialog import LtxVideoTipsDialog
 from ui.preview_pane import PreviewPane
 from ui.surface_widgets import (
@@ -305,6 +306,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.splitter)
         self.setCentralWidget(central)
         self._create_menus()
+        self.file_list_pane.set_reload_action(self.reload_folder_action)
         self.status_icon = QLabel()
         self.status_icon.setObjectName("statusIcon")
         self.statusBar().addWidget(self.status_icon)
@@ -323,6 +325,14 @@ class MainWindow(QMainWindow):
         select_file.triggered.connect(self._select_file)
         select_folder = file_menu.addAction("フォルダを開く(&D)...")
         select_folder.triggered.connect(self._select_folder)
+        self.reload_folder_action = file_menu.addAction(
+            "現在のフォルダを再読み込み"
+        )
+        self.reload_folder_action.setShortcut("F5")
+        self.reload_folder_action.setEnabled(False)
+        self.reload_folder_action.triggered.connect(
+            self._reload_current_folder
+        )
         self.recent_folders_menu = file_menu.addMenu("最近開いたフォルダ")
         self._refresh_recent_folders_menu()
         file_menu.addSeparator()
@@ -334,9 +344,11 @@ class MainWindow(QMainWindow):
         self.include_subfolders_action.toggled.connect(
             self._set_include_subfolders
         )
-        missing_items = file_menu.addAction("見つからない項目を確認・整理")
-        missing_items.setEnabled(False)
-        missing_items.setToolTip("今後追加予定")
+        self.missing_items_action = file_menu.addAction(
+            "見つからない項目を確認・整理"
+        )
+        self.missing_items_action.setEnabled(self.database is not None)
+        self.missing_items_action.triggered.connect(self._show_missing_items)
         file_menu.addSeparator()
         exit_action = file_menu.addAction("終了(&X)")
         exit_action.triggered.connect(self.close)
@@ -381,11 +393,20 @@ class MainWindow(QMainWindow):
 
     def _show_version(self) -> None:
         QMessageBox.information(
-            self, "バージョン情報", "METAMI Ver1.0.3"
+            self, "バージョン情報", "METAMI Ver1.0.4"
         )
 
     def _show_ltx_video_tips(self) -> None:
         dialog = LtxVideoTipsDialog(self)
+        dialog.exec()
+
+    def _show_missing_items(self) -> None:
+        if self.database is None:
+            self._set_status(
+                "ユーザー情報DBを使用できないため確認できません。", "error"
+            )
+            return
+        dialog = MissingItemsDialog(self.database, self)
         dialog.exec()
 
     def _select_file(self) -> None:
@@ -444,6 +465,7 @@ class MainWindow(QMainWindow):
             if not self._resolve_unsaved_memo():
                 return
             self._current_folder = None
+            self.reload_folder_action.setEnabled(False)
             self._set_paths([path])
             return
         self._open_folder(path)
@@ -454,6 +476,8 @@ class MainWindow(QMainWindow):
         *,
         add_to_history: bool = True,
         resolve_unsaved: bool = True,
+        select_first: bool = True,
+        include_registered_missing: bool = True,
     ) -> bool:
         """既存の一覧更新経路を使ってフォルダを開く。"""
         if not path.exists() or not path.is_dir():
@@ -475,10 +499,14 @@ class MainWindow(QMainWindow):
             )
             return False
         self._current_folder = path
+        self.reload_folder_action.setEnabled(True)
         if add_to_history:
             self._record_recent_folder(path)
         display_paths = self._set_paths(
-            list(result.paths), source_directory=path
+            list(result.paths),
+            source_directory=path,
+            select_first=select_first,
+            include_registered_missing=include_registered_missing,
         )
         if not display_paths:
             self.preview_pane.clear(
@@ -502,6 +530,46 @@ class MainWindow(QMainWindow):
                 "error",
             )
         return True
+
+    def _reload_current_folder(self) -> None:
+        """現在フォルダを履歴へ触れず、同じ探索設定で読み直す。"""
+        folder = self._current_folder
+        if folder is None:
+            return
+        try:
+            folder_available = folder.is_dir()
+        except OSError:
+            folder_available = False
+        if not folder_available:
+            self._current_folder = None
+            self.reload_folder_action.setEnabled(False)
+            self._set_status(
+                "現在のフォルダが見つかりません。"
+                "フォルダが移動または削除された可能性があります。",
+                "error",
+            )
+            return
+        if not self._resolve_unsaved_memo():
+            return
+        selected_path = self._current_path
+        if not self._open_folder(
+            folder,
+            add_to_history=False,
+            resolve_unsaved=False,
+            select_first=False,
+            include_registered_missing=False,
+        ):
+            return
+        if (
+            selected_path is not None
+            and selected_path.is_file()
+            and self.file_list_pane.select_path(selected_path)
+        ):
+            return
+        self.file_list_pane.select_path(Path(""))
+        self._show_no_search_results(
+            "フォルダを再読み込みしました。ファイルを選択してください。"
+        )
 
     @staticmethod
     def _folder_key(path: str | Path) -> str:
@@ -588,7 +656,12 @@ class MainWindow(QMainWindow):
             )
 
     def _set_paths(
-        self, paths: list[Path], source_directory: Path | None = None
+        self,
+        paths: list[Path],
+        source_directory: Path | None = None,
+        *,
+        select_first: bool = True,
+        include_registered_missing: bool = True,
     ) -> list[Path]:
         """一覧を更新し、利用可能なら識別情報をDBへ記録する。"""
         display_paths = list(paths)
@@ -605,7 +678,7 @@ class MainWindow(QMainWindow):
             try:
                 self.database.register_files(paths)
                 missing_states = self.database.check_registered_files()
-                if source_directory is not None:
+                if source_directory is not None and include_registered_missing:
                     known_paths = self.database.get_registered_paths_in_directory(
                         source_directory
                     )
@@ -651,6 +724,7 @@ class MainWindow(QMainWindow):
                 self._set_database_state("error")
         self.file_list_pane.set_paths(
             display_paths,
+            select_first=select_first,
             source_directory=source_directory,
             ratings=ratings,
             tags_by_path=tags_by_path,

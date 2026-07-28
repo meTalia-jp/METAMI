@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 from PySide6.QtCore import QSize, QStringListModel, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QImageReader, QMouseEvent, QPixmap
+from PySide6.QtGui import QAction, QColor, QImageReader, QMouseEvent, QPixmap
 from PySide6.QtMultimedia import QMediaPlayer, QVideoFrame, QVideoSink
 from PySide6.QtWidgets import (
     QBoxLayout,
@@ -594,6 +594,7 @@ class FileListPane(QWidget):
         self.search_edit.setObjectName("searchEdit")
         self.search_edit.setPlaceholderText("検索キーワード")
         self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setMaximumWidth(230)
         self.target_combo = QComboBox()
         self.target_combo.setObjectName("searchTarget")
         for label, value in (
@@ -673,29 +674,41 @@ class FileListPane(QWidget):
         self.open_file_button = QToolButton()
         self.open_file_button.setObjectName("sourceButton")
         self.open_file_button.setText("▤  ファイルを開く")
+        self.open_file_button.setMinimumWidth(142)
         self.open_file_button.setToolTip("PNG、WEBP、JPG/JPEG、MP4を1件開く")
         self.open_file_button.clicked.connect(self.openFileRequested.emit)
         self.open_folder_button = QToolButton()
         self.open_folder_button.setObjectName("sourceButton")
         self.open_folder_button.setText("▰  フォルダを開く")
+        self.open_folder_button.setMinimumWidth(142)
         self.open_folder_button.setToolTip("対応ファイルを含むフォルダを開く")
         self.open_folder_button.clicked.connect(self.openFolderRequested.emit)
+        self.reload_folder_button = QToolButton()
+        self.reload_folder_button.setObjectName("sourceButton")
+        self.reload_folder_button.setText("再読込み")
+        self.reload_folder_button.setMinimumWidth(142)
+        self.reload_folder_button.setToolTip(
+            "現在開いているフォルダの内容を再読み込みします"
+        )
+        self.reload_folder_button.setEnabled(False)
 
-        source_actions = QHBoxLayout()
+        source_actions = QVBoxLayout()
         source_actions.setContentsMargins(0, 0, 0, 0)
         source_actions.setSpacing(5)
-        source_actions.addWidget(self.open_file_button, 1)
-        source_actions.addWidget(self.open_folder_button, 1)
+        source_actions.addWidget(self.open_file_button)
+        source_actions.addWidget(self.open_folder_button)
+        source_actions.addWidget(self.reload_folder_button)
+        source_actions.addStretch(1)
 
         self.identity_panel = QWidget()
         self.identity_panel.setObjectName("taliaIdentityPanel")
         self.identity_panel.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
         )
-        identity_layout = QVBoxLayout(self.identity_panel)
+        identity_layout = QHBoxLayout(self.identity_panel)
         identity_layout.setContentsMargins(0, 0, 0, 0)
-        identity_layout.setSpacing(5)
-        identity_layout.addWidget(self.character_header)
+        identity_layout.setSpacing(8)
+        identity_layout.addWidget(self.character_header, 1)
         identity_layout.addLayout(source_actions)
 
         count_row = QHBoxLayout()
@@ -706,7 +719,8 @@ class FileListPane(QWidget):
         search_row = QHBoxLayout()
         search_row.setContentsMargins(0, 0, 0, 0)
         search_row.setSpacing(5)
-        search_row.addWidget(self.search_edit, 1)
+        search_row.addWidget(self.search_edit)
+        search_row.addStretch(1)
         filter_row = QHBoxLayout()
         filter_row.setContentsMargins(0, 0, 0, 0)
         filter_row.setSpacing(5)
@@ -805,9 +819,9 @@ class FileListPane(QWidget):
         )
         if self.top_layout.direction() != direction:
             self.top_layout.setDirection(direction)
-        self.identity_panel.setMaximumWidth(285 if wide else 16777215)
-        self.identity_panel.setMinimumWidth(255 if wide else 0)
-        self.search_panel.setMinimumWidth(410 if wide else 0)
+        self.identity_panel.setMaximumWidth(430 if wide else 16777215)
+        self.identity_panel.setMinimumWidth(385 if wide else 0)
+        self.search_panel.setMinimumWidth(285 if wide else 0)
         self.top_layout.invalidate()
         self.top_panel.updateGeometry()
         if self.layout() is not None:
@@ -1060,6 +1074,14 @@ class FileListPane(QWidget):
     def all_paths(self) -> list[Path]:
         """現在の一覧ソース（フィルター適用前）を返す。"""
         return list(self._all_paths)
+
+    def set_reload_action(self, action: QAction) -> None:
+        """メニュー・F5と同じ再読み込みQActionをボタンへ設定する。"""
+        self.reload_folder_button.clicked.connect(action.trigger)
+        action.changed.connect(
+            lambda: self.reload_folder_button.setEnabled(action.isEnabled())
+        )
+        self.reload_folder_button.setEnabled(action.isEnabled())
 
     def set_rating(self, path: Path, rating: int) -> None:
         """表示と絞り込みが参照する星ランクを更新する。"""

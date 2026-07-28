@@ -117,9 +117,10 @@ class Ver10UiSmallUpdateTests(unittest.TestCase):
             self.assertFalse(
                 file_actions["見つからない項目を確認・整理"].isEnabled()
             )
+            self.assertIn("現在のフォルダを再読み込み", file_actions)
             self.assertEqual(
-                file_actions["見つからない項目を確認・整理"].toolTip(),
-                "今後追加予定",
+                file_actions["現在のフォルダを再読み込み"].shortcut().toString(),
+                "F5",
             )
             view_actions = [
                 action.text() for action in window.view_menu.actions()
