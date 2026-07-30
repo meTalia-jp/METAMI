@@ -40,24 +40,31 @@ class StickyNoteFrame(QFrame):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         tone = str(self.property("noteTone") or "yellow")
+        landscape = bool(self.property("landscape"))
         top_color, bottom_color, border_color = self._PAPER_COLORS.get(
             tone, self._PAPER_COLORS["yellow"]
         )
-        note_rect = QRectF(self.rect()).adjusted(0.8, 8.0, -4.0, -4.0)
+        note_rect = QRectF(self.rect()).adjusted(
+            0.8,
+            0.8 if landscape else 8.0,
+            -0.8 if landscape else -4.0,
+            -0.8 if landscape else -4.0,
+        )
         paper = QPainterPath()
         paper.addRoundedRect(note_rect, 3, 3)
 
         # めくれは作らず、右下へ重なる薄い多段影だけで紙を浮かせる。
-        painter.setPen(Qt.PenStyle.NoPen)
-        for offset_x, offset_y, alpha in (
-            (2.8, 3.0, 18),
-            (1.8, 2.0, 26),
-            (0.9, 1.1, 34),
-        ):
-            painter.setBrush(QColor(38, 42, 48, alpha))
-            painter.drawRoundedRect(
-                note_rect.translated(offset_x, offset_y), 3.5, 3.5
-            )
+        if not landscape:
+            painter.setPen(Qt.PenStyle.NoPen)
+            for offset_x, offset_y, alpha in (
+                (2.8, 3.0, 18),
+                (1.8, 2.0, 26),
+                (0.9, 1.1, 34),
+            ):
+                painter.setBrush(QColor(38, 42, 48, alpha))
+                painter.drawRoundedRect(
+                    note_rect.translated(offset_x, offset_y), 3.5, 3.5
+                )
 
         gradient = QLinearGradient(note_rect.topLeft(), note_rect.bottomRight())
         gradient.setColorAt(0.0, QColor(top_color))

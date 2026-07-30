@@ -9,6 +9,7 @@ from PySide6.QtCore import QSize, QStringListModel, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QImageReader, QMouseEvent, QPixmap
 from PySide6.QtMultimedia import QMediaPlayer, QVideoFrame, QVideoSink
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QBoxLayout,
     QComboBox,
     QCompleter,
@@ -29,7 +30,17 @@ from metadata.mp4_reader import Mp4ReadError, read_mp4_info
 from metadata.search_service import SearchRecord, build_search_record
 from ui.decorations import CharacterHeader, memo_pixmap
 from ui.surface_widgets import MagnetPin, StickyNoteFrame
-from ui.styles import CARD_HEIGHT, CARD_THUMBNAIL_SIZE, CARD_WIDTH
+from ui.styles import (
+    CARD_HEIGHT,
+    CARD_THUMBNAIL_SIZE,
+    CARD_WIDTH,
+    LANDSCAPE_CARD_HEIGHT,
+    LANDSCAPE_THUMBNAIL_SIZE,
+)
+
+
+THUMBNAIL_VIEW = "thumbnail"
+LANDSCAPE_VIEW = "landscape"
 
 
 class ResponsiveTagBar(QWidget):
@@ -169,6 +180,7 @@ class FileCard(StickyNoteFrame):
         memo: str = "",
         user_title: str = "",
         relative_hint: str = "",
+        details_text: str = "",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -202,11 +214,7 @@ class FileCard(StickyNoteFrame):
         self.name_label.setToolTip(str(path))
         self.set_user_title(user_title)
 
-        badge = QLabel(path.suffix.removeprefix(".").upper())
-        badge.setObjectName("formatBadge")
-        badge.setProperty("format", path.suffix.removeprefix(".").upper())
-        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setFixedWidth(48)
+        badge = _format_badge(path)
 
         name_row = QHBoxLayout()
         name_row.setSpacing(6)
@@ -224,7 +232,7 @@ class FileCard(StickyNoteFrame):
         name_row.addWidget(self.missing_badge, 0, Qt.AlignmentFlag.AlignTop)
         name_row.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
 
-        self._available_details = self._file_details(path)
+        self._available_details = details_text or self._file_details(path)
         if relative_hint:
             self._available_details = (
                 f"場所: {relative_hint}\n{self._available_details}"
@@ -551,6 +559,213 @@ class FileCard(StickyNoteFrame):
         return "  ·  ".join(values)
 
 
+class LandscapeFileCard(StickyNoteFrame):
+    """左にサムネイル、右に交換しやすい情報行を置く横長カード。"""
+
+    activated = Signal()
+    ratingChanged = Signal(str, int)
+
+    def __init__(
+        self,
+        path: Path,
+        rating: int = 0,
+        tags: list[str] | None = None,
+        missing: bool = False,
+        memo: str = "",
+        user_title: str = "",
+        details_text: str = "",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.path = path
+        self._name_text = user_title.strip() or path.name
+        self._tags_text = "、".join(tags or []) or "なし"
+        self._memo_text = re.sub(r"\s+", " ", memo).strip() or "なし"
+        self.setObjectName("fileCard")
+        self.setProperty("selected", False)
+        self.setProperty("landscape", True)
+        self.setProperty("missing", missing)
+        tone = ("lavender", "pink", "mint", "yellow", "blue")[
+            sum(path.name.encode("utf-8")) % 5
+        ]
+        self.setProperty("noteTone", tone)
+        self.thumbnail = QLabel("ファイルなし" if missing else "読込中")
+        self.thumbnail.setObjectName("landscapeThumbnail")
+        self.thumbnail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumbnail.setFixedSize(QSize(*LANDSCAPE_THUMBNAIL_SIZE))
+
+        self.name_label = QLabel(self._name_text)
+        self.name_label.setObjectName("landscapeFileName")
+        self.name_label.setToolTip(str(path))
+        self.favorite_button = QToolButton()
+        self.favorite_button.setObjectName("favoriteButton")
+        self.favorite_button.clicked.connect(self._advance_rating)
+        self.set_rating(rating)
+
+        name_row = QHBoxLayout()
+        name_row.setContentsMargins(0, 0, 0, 0)
+        name_row.setSpacing(6)
+        self.format_badge = _format_badge(path)
+        name_row.addWidget(self.format_badge)
+        name_row.addWidget(self.name_label, 1)
+        name_row.addWidget(self.favorite_button)
+
+        self.analysis_label = QLabel(details_text)
+        self.analysis_label.setObjectName("landscapeMetadata")
+        self.analysis_label.setToolTip(details_text)
+
+        self.tags_heading = QLabel("タグ")
+        self.tags_heading.setObjectName("landscapeFieldHeading")
+        self.tags_label = QLabel(self._tags_text)
+        self.tags_label.setObjectName("landscapeTags")
+        self.tags_label.setToolTip(self._tags_text)
+        basic_tags_row = QHBoxLayout()
+        basic_tags_row.setContentsMargins(0, 0, 0, 0)
+        basic_tags_row.setSpacing(8)
+        basic_tags_row.addWidget(self.analysis_label)
+        basic_tags_row.addWidget(self.tags_heading)
+        basic_tags_row.addWidget(self.tags_label, 1)
+
+        self.memo_heading = QLabel("メモ")
+        self.memo_heading.setObjectName("landscapeFieldHeading")
+        self.memo_label = QLabel(self._memo_text)
+        self.memo_label.setObjectName("landscapeMemo")
+        self.memo_label.setToolTip(memo)
+        self.memo_label.setWordWrap(True)
+        self.memo_label.setMinimumHeight(
+            self.memo_label.fontMetrics().lineSpacing() * 2 + 8
+        )
+        memo_row = QHBoxLayout()
+        memo_row.setContentsMargins(0, 0, 0, 0)
+        memo_row.setSpacing(8)
+        memo_row.addWidget(
+            self.memo_heading, 0, Qt.AlignmentFlag.AlignTop
+        )
+        memo_row.addWidget(self.memo_label, 1)
+
+        info = QWidget()
+        info.setObjectName("landscapeInfo")
+        info_layout = QVBoxLayout(info)
+        info_layout.setContentsMargins(0, 0, 0, 0)
+        info_layout.setSpacing(3)
+        info_layout.addLayout(name_row)
+        info_layout.addLayout(basic_tags_row)
+        info_layout.addLayout(memo_row)
+        info_layout.addStretch(1)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 10, 12, 10)
+        layout.setSpacing(12)
+        layout.addWidget(self.thumbnail, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(info, 1)
+        self.setFixedHeight(LANDSCAPE_CARD_HEIGHT)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._update_elided_text()
+
+    def set_thumbnail(self, pixmap: QPixmap) -> None:
+        if pixmap.isNull():
+            self.thumbnail.setPixmap(QPixmap())
+            self.thumbnail.setText("画像なし")
+            return
+        self.thumbnail.setText("")
+        self.thumbnail.setPixmap(
+            pixmap.scaled(
+                self.thumbnail.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def set_selected(self, selected: bool) -> None:
+        self.setProperty("selected", selected)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def set_rating(self, rating: int) -> None:
+        self.rating = max(0, min(3, rating))
+        self.favorite_button.setText(
+            "★" * self.rating + "☆" * (3 - self.rating)
+        )
+        self.favorite_button.setProperty("rating", self.rating)
+        self.favorite_button.style().unpolish(self.favorite_button)
+        self.favorite_button.style().polish(self.favorite_button)
+        self.favorite_button.setToolTip(
+            f"現在: 星{self.rating}（クリックで変更）"
+            if self.rating
+            else "現在: 星なし（クリックで変更）"
+        )
+
+    def set_tags(self, tags: list[str]) -> None:
+        self._tags_text = "、".join(tags) or "なし"
+        self.tags_label.setToolTip(self._tags_text)
+        self._update_elided_text()
+
+    def set_memo_present(self, present: bool) -> None:
+        if not present:
+            self.set_memo("")
+
+    def set_memo(self, memo: str) -> None:
+        self._memo_text = re.sub(r"\s+", " ", memo).strip() or "なし"
+        self.memo_label.setToolTip(memo)
+        self._update_elided_text()
+
+    def set_user_title(self, title: str) -> None:
+        self._name_text = title.strip() or self.path.name
+        self.name_label.setToolTip(str(self.path))
+        self._update_elided_text()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_elided_text()
+
+    def _update_elided_text(self) -> None:
+        available = max(80, self.width() - LANDSCAPE_THUMBNAIL_SIZE[0] - 46)
+        self.name_label.setText(
+            self.name_label.fontMetrics().elidedText(
+                self._name_text, Qt.TextElideMode.ElideRight, available - 70
+            )
+        )
+        self.tags_label.setText(
+            self.tags_label.fontMetrics().elidedText(
+                self._tags_text,
+                Qt.TextElideMode.ElideRight,
+                max(
+                    24,
+                    available
+                    - self.analysis_label.sizeHint().width()
+                    - self.tags_heading.sizeHint().width()
+                    - 16,
+                ),
+            )
+        )
+        self.memo_label.setText(
+            _elide_multiline(
+                self.memo_label.fontMetrics(),
+                self._memo_text,
+                max(
+                    40,
+                    available
+                    - self.memo_heading.sizeHint().width()
+                    - 8,
+                ),
+                2,
+            )
+        )
+
+    def _advance_rating(self) -> None:
+        rating = (self.rating + 1) % 4
+        self.set_rating(rating)
+        self.ratingChanged.emit(str(self.path), rating)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.activated.emit()
+        super().mousePressEvent(event)
+
+
 class FileListPane(QWidget):
     """対応ファイルを実サムネイル付きネタカードで一覧表示する。"""
 
@@ -565,6 +780,9 @@ class FileListPane(QWidget):
         self.setObjectName("taliaWorkspace")
         self._video_queue: list[tuple[QListWidgetItem, Path]] = []
         self._current_video_item: QListWidgetItem | None = None
+        self._view_mode = THUMBNAIL_VIEW
+        self._thumbnail_cache: dict[str, QPixmap] = {}
+        self._details_cache: dict[str, str] = {}
         self._all_paths: list[Path] = []
         self._search_records: list[SearchRecord] = []
         self._ratings: dict[str, int] = {}
@@ -808,6 +1026,8 @@ class FileListPane(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._update_top_layout(event.size().width())
+        if self._view_mode == LANDSCAPE_VIEW:
+            self._resize_landscape_items()
 
     def _update_top_layout(self, width: int) -> None:
         """狭い時だけ上下配置へ戻し、操作部品の潰れを防止する。"""
@@ -850,6 +1070,8 @@ class FileListPane(QWidget):
         titles_by_path: dict[str, str] | None = None,
         missing_paths: set[str] | None = None,
     ) -> None:
+        self._thumbnail_cache.clear()
+        self._details_cache.clear()
         self._all_paths = list(paths)
         self._source_directory = source_directory
         self._ratings = dict(ratings or {})
@@ -891,7 +1113,10 @@ class FileListPane(QWidget):
         self._apply_filters(select_first=select_first)
 
     def _populate_paths(
-        self, paths: list[Path], select_first: bool = True
+        self,
+        paths: list[Path],
+        select_first: bool = True,
+        restore_path: str | None = None,
     ) -> None:
         selected_item = self.list_widget.currentItem()
         selected_path = (
@@ -910,7 +1135,7 @@ class FileListPane(QWidget):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, str(path))
             item.setToolTip(str(path))
-            item.setSizeHint(QSize(CARD_WIDTH, CARD_HEIGHT))
+            item.setSizeHint(self._card_item_size())
             key = self._path_key(path)
             relative_hint = ""
             if (
@@ -923,16 +1148,32 @@ class FileListPane(QWidget):
                     )
                 except ValueError:
                     relative_hint = str(path)
-            card = FileCard(
-                path,
-                self._ratings.get(key, 0),
-                self.get_tags(path),
-                key in self._memo_paths,
-                key in self._missing_paths,
-                memo=self._memos_by_path.get(key, ""),
-                user_title=self._titles_by_path.get(key, ""),
-                relative_hint=relative_hint,
-            )
+            details_text = self._details_cache.get(key)
+            if details_text is None:
+                details_text = FileCard._file_details(path)
+                self._details_cache[key] = details_text
+            if self._view_mode == LANDSCAPE_VIEW:
+                card = LandscapeFileCard(
+                    path,
+                    self._ratings.get(key, 0),
+                    self.get_tags(path),
+                    key in self._missing_paths,
+                    memo=self._memos_by_path.get(key, ""),
+                    user_title=self._titles_by_path.get(key, ""),
+                    details_text=details_text,
+                )
+            else:
+                card = FileCard(
+                    path,
+                    self._ratings.get(key, 0),
+                    self.get_tags(path),
+                    key in self._memo_paths,
+                    key in self._missing_paths,
+                    memo=self._memos_by_path.get(key, ""),
+                    user_title=self._titles_by_path.get(key, ""),
+                    relative_hint=relative_hint,
+                    details_text=details_text,
+                )
             card.activated.connect(
                 lambda item=item: self.list_widget.setCurrentItem(item)
             )
@@ -940,15 +1181,39 @@ class FileListPane(QWidget):
             self.list_widget.addItem(item)
             self.list_widget.setItemWidget(item, card)
             if key not in self._missing_paths:
-                pixmap = self._image_thumbnail(path)
+                pixmap = self._thumbnail_cache.get(key, QPixmap())
+                if pixmap.isNull():
+                    pixmap = self._image_thumbnail(path)
+                    if not pixmap.isNull():
+                        self._thumbnail_cache[key] = pixmap
                 if not pixmap.isNull():
                     card.set_thumbnail(pixmap)
                 elif path.suffix.lower() == ".mp4":
                     self._video_queue.append((item, path))
                 else:
                     card.set_thumbnail(QPixmap())
+        restored_row = next(
+            (
+                index
+                for index, path in enumerate(paths)
+                if restore_path is not None and str(path) == restore_path
+            ),
+            -1,
+        )
+        if restored_row >= 0:
+            self.list_widget.setCurrentRow(restored_row)
+            restored_card = self.list_widget.itemWidget(
+                self.list_widget.item(restored_row)
+            )
+            if isinstance(restored_card, (FileCard, LandscapeFileCard)):
+                restored_card.set_selected(True)
         self.list_widget.blockSignals(False)
-        if paths and select_first:
+        if restored_row >= 0:
+            self.list_widget.scrollToItem(
+                self.list_widget.item(restored_row),
+                QAbstractItemView.ScrollHint.PositionAtCenter,
+            )
+        elif paths and select_first:
             selected_row = next(
                 (
                     index
@@ -961,6 +1226,77 @@ class FileListPane(QWidget):
         elif not paths:
             self.selectionCleared.emit("検索条件に一致するネタがありません。")
         self._advance_video_thumbnail()
+
+    def set_view_mode(self, mode: str) -> None:
+        """表示中データを再取得せず、カードレイアウトだけを切り替える。"""
+        if mode not in {THUMBNAIL_VIEW, LANDSCAPE_VIEW}:
+            raise ValueError(f"未対応の表示形式です: {mode}")
+        if mode == self._view_mode:
+            return
+        displayed_paths = [
+            Path(self.list_widget.item(index).data(Qt.ItemDataRole.UserRole))
+            for index in range(self.list_widget.count())
+        ]
+        current = self.list_widget.currentItem()
+        selected_path = (
+            str(current.data(Qt.ItemDataRole.UserRole))
+            if current is not None
+            else None
+        )
+        self._view_mode = mode
+        self._configure_list_view()
+        if not displayed_paths:
+            return
+        self._populate_paths(
+            displayed_paths,
+            select_first=False,
+            restore_path=selected_path,
+        )
+
+    def view_mode(self) -> str:
+        return self._view_mode
+
+    def _configure_list_view(self) -> None:
+        if self._view_mode == LANDSCAPE_VIEW:
+            self.list_widget.setViewMode(QListWidget.ViewMode.ListMode)
+            self.list_widget.setFlow(QListWidget.Flow.TopToBottom)
+            self.list_widget.setWrapping(False)
+            self.list_widget.setGridSize(QSize())
+            self.list_widget.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self.list_widget.setSpacing(4)
+            self._resize_landscape_items()
+            return
+        self.list_widget.setViewMode(QListWidget.ViewMode.IconMode)
+        self.list_widget.setFlow(QListWidget.Flow.LeftToRight)
+        self.list_widget.setWrapping(True)
+        self.list_widget.setGridSize(
+            QSize(CARD_WIDTH + 12, CARD_HEIGHT + 12)
+        )
+        self.list_widget.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.list_widget.setSpacing(7)
+
+    def _card_item_size(self) -> QSize:
+        if self._view_mode == LANDSCAPE_VIEW:
+            return QSize(
+                max(240, self.list_widget.viewport().width() - 18),
+                LANDSCAPE_CARD_HEIGHT + 2,
+            )
+        return QSize(CARD_WIDTH, CARD_HEIGHT)
+
+    def _resize_landscape_items(self) -> None:
+        if not hasattr(self, "list_widget"):
+            return
+        size = self._card_item_size()
+        for index in range(self.list_widget.count()):
+            item = self.list_widget.item(index)
+            item.setSizeHint(size)
+            card = self.list_widget.itemWidget(item)
+            if isinstance(card, LandscapeFileCard):
+                card.setFixedWidth(size.width())
 
     def clear(self) -> None:
         self.set_paths([], select_first=False)
@@ -1208,14 +1544,20 @@ class FileListPane(QWidget):
                 self._search_records[index] = self._build_search_record(path)
                 return
 
-    def _visible_card(self, path: Path) -> FileCard | None:
+    def _visible_card(
+        self, path: Path
+    ) -> FileCard | LandscapeFileCard | None:
         key = self._path_key(path)
         for index in range(self.list_widget.count()):
             item = self.list_widget.item(index)
             item_path = Path(item.data(Qt.ItemDataRole.UserRole))
             if self._path_key(item_path) == key:
                 card = self.list_widget.itemWidget(item)
-                return card if isinstance(card, FileCard) else None
+                return (
+                    card
+                    if isinstance(card, (FileCard, LandscapeFileCard))
+                    else None
+                )
         return None
 
     def _set_tag_filter_items(
@@ -1290,11 +1632,11 @@ class FileListPane(QWidget):
     ) -> None:
         if previous is not None:
             previous_card = self.list_widget.itemWidget(previous)
-            if isinstance(previous_card, FileCard):
+            if isinstance(previous_card, (FileCard, LandscapeFileCard)):
                 previous_card.set_selected(False)
         if current is not None:
             current_card = self.list_widget.itemWidget(current)
-            if isinstance(current_card, FileCard):
+            if isinstance(current_card, (FileCard, LandscapeFileCard)):
                 current_card.set_selected(True)
             self.fileSelected.emit(current.data(Qt.ItemDataRole.UserRole))
 
@@ -1324,8 +1666,13 @@ class FileListPane(QWidget):
         if image.isNull():
             return
         card = self.list_widget.itemWidget(self._current_video_item)
-        if isinstance(card, FileCard):
-            card.set_thumbnail(QPixmap.fromImage(image))
+        if isinstance(card, (FileCard, LandscapeFileCard)):
+            pixmap = QPixmap.fromImage(image)
+            path = Path(
+                self._current_video_item.data(Qt.ItemDataRole.UserRole)
+            )
+            self._thumbnail_cache[self._path_key(path)] = pixmap
+            card.set_thumbnail(pixmap)
         self._finish_current_video_thumbnail()
 
     def _on_thumbnail_error(
@@ -1333,7 +1680,7 @@ class FileListPane(QWidget):
     ) -> None:
         if self._current_video_item is not None:
             card = self.list_widget.itemWidget(self._current_video_item)
-            if isinstance(card, FileCard):
+            if isinstance(card, (FileCard, LandscapeFileCard)):
                 card.set_thumbnail(QPixmap())
             self._finish_current_video_thumbnail()
 
@@ -1367,3 +1714,43 @@ def _format_duration(seconds: float) -> str:
         if hours
         else f"{minutes}:{remaining:02d}"
     )
+
+
+def _format_badge(path: Path) -> QLabel:
+    """既存カード共通の拡張子バッジを生成する。"""
+    file_format = path.suffix.removeprefix(".").upper()
+    badge = QLabel(file_format)
+    badge.setObjectName("formatBadge")
+    badge.setProperty("format", file_format)
+    badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    badge.setFixedWidth(48)
+    badge.setToolTip(f"{file_format}ファイル")
+    return badge
+
+
+def _elide_multiline(metrics, text: str, width: int, lines: int) -> str:
+    """空白のない日本語も含め、指定行数の末尾を省略する。"""
+    if not text or lines <= 0:
+        return ""
+    remaining = text
+    result: list[str] = []
+    for line_index in range(lines):
+        if metrics.horizontalAdvance(remaining) <= width:
+            result.append(remaining)
+            break
+        if line_index == lines - 1:
+            result.append(
+                metrics.elidedText(
+                    remaining, Qt.TextElideMode.ElideRight, width
+                )
+            )
+            break
+        cut = 1
+        while (
+            cut < len(remaining)
+            and metrics.horizontalAdvance(remaining[: cut + 1]) <= width
+        ):
+            cut += 1
+        result.append(remaining[:cut])
+        remaining = remaining[cut:]
+    return "\n".join(result)

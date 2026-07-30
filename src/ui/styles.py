@@ -289,6 +289,9 @@ QFrame#fileCard[selected="true"][missing="true"] {
     background: #f4eaff;
     border: 2px solid $lavender_dark;
 }
+QFrame#fileCard[landscape="true"] {
+    border-radius: 3px;
+}
 QLabel#missingBadge {
     background: #fbe3dc;
     border: 1px solid #d5a092;
@@ -405,6 +408,44 @@ QLabel#cardFileName {
 QLabel#cardDetails, QLabel#itemCount {
     color: $muted_ink;
     font-size: $size_small;
+}
+QLabel#landscapeThumbnail {
+    background: #ebe8e3;
+    border: 1px solid #d5cec5;
+    border-radius: 6px;
+    color: $muted_ink;
+    font-size: 8pt;
+}
+QWidget#landscapeInfo {
+    background: transparent;
+}
+QLabel#landscapeFileName {
+    color: $ink;
+    font-family: $font_technical;
+    font-size: 10pt;
+    font-weight: $weight_medium;
+}
+QLabel#landscapeMetadata {
+    color: $muted_ink;
+    font-size: 8pt;
+}
+QLabel#landscapeFieldHeading {
+    color: $ink;
+    font-size: 8pt;
+    font-weight: $weight_bold;
+}
+QLabel#landscapeTags {
+    color: #405f4b;
+    font-size: 8pt;
+    min-height: 16px;
+}
+QLabel#landscapeMemo {
+    background: rgba(255, 255, 255, 105);
+    border: none;
+    border-left: 2px solid #c9a9cf;
+    color: #6e6171;
+    font-size: 8pt;
+    padding: 2px 0 2px 8px;
 }
 QLabel#formatBadge {
     background: $lavender_soft;
@@ -734,3 +775,5 @@ DETAIL_SPLITTER_SIZES = [55, 45]
 CARD_WIDTH = 210
 CARD_THUMBNAIL_SIZE = (184, 104)
 CARD_HEIGHT = 210
+LANDSCAPE_CARD_HEIGHT = 124
+LANDSCAPE_THUMBNAIL_SIZE = (150, 100)

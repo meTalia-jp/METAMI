@@ -127,7 +127,12 @@ class Ver10UiSmallUpdateTests(unittest.TestCase):
             ]
             self.assertEqual(
                 view_actions,
-                ["表示タブの設定", "表示を初期状態に戻す"],
+                [
+                    "表示形式",
+                    "",
+                    "表示タブの設定",
+                    "表示を初期状態に戻す",
+                ],
             )
             help_actions = [
                 action.text() for action in window.help_menu.actions()

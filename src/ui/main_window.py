@@ -7,7 +7,14 @@ import random
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, QSize, QTimer, Qt
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QPainter, QPen
+from PySide6.QtGui import (
+    QActionGroup,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QPainter,
+    QPen,
+)
 from PySide6.QtWidgets import (
     QAbstractButton,
     QDialog,
@@ -28,7 +35,11 @@ from metadata.media_finder import (
     find_media_files,
 )
 from storage.database import DatabaseError, MetadataDatabase
-from ui.file_list_pane import FileListPane
+from ui.file_list_pane import (
+    LANDSCAPE_VIEW,
+    THUMBNAIL_VIEW,
+    FileListPane,
+)
 from ui.decorations import (
     status_pixmap,
 )
@@ -53,6 +64,7 @@ from ui.styles import (
 APP_TITLE = "M.E.T.A.M.I."
 RECENT_FOLDERS_KEY = "folders/recent"
 INCLUDE_SUBFOLDERS_KEY = "folders/includeSubfolders"
+CARD_VIEW_MODE_KEY = "display/cardViewMode"
 MAX_RECENT_FOLDERS = 5
 RATING_IMAGE_DELAY_MS = 18_000
 RATING_RETRY_DELAY_MS = 1_500
@@ -198,6 +210,14 @@ class MainWindow(QMainWindow):
         self._include_subfolders = self._setting_bool(
             INCLUDE_SUBFOLDERS_KEY, False
         )
+        saved_view_mode = str(
+            self.settings.value(CARD_VIEW_MODE_KEY, THUMBNAIL_VIEW)
+        )
+        self._card_view_mode = (
+            saved_view_mode
+            if saved_view_mode in {THUMBNAIL_VIEW, LANDSCAPE_VIEW}
+            else THUMBNAIL_VIEW
+        )
         self._current_folder: Path | None = None
         self._current_path: Path | None = None
         self._ignore_next_file_signal = False
@@ -306,6 +326,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.splitter)
         self.setCentralWidget(central)
         self._create_menus()
+        self.file_list_pane.set_view_mode(self._card_view_mode)
         self.file_list_pane.set_reload_action(self.reload_folder_action)
         self.status_icon = QLabel()
         self.status_icon.setObjectName("statusIcon")
@@ -354,6 +375,37 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         view_menu = self.menuBar().addMenu("表示(&V)")
         self.view_menu = view_menu
+        card_view_menu = view_menu.addMenu("表示形式")
+        self.card_view_menu = card_view_menu
+        self.card_view_group = QActionGroup(self)
+        self.card_view_group.setExclusive(True)
+        self.thumbnail_card_action = card_view_menu.addAction(
+            "サムネイルカード"
+        )
+        self.landscape_card_action = card_view_menu.addAction(
+            "ランドスケープカード"
+        )
+        for action in (
+            self.thumbnail_card_action,
+            self.landscape_card_action,
+        ):
+            action.setCheckable(True)
+            self.card_view_group.addAction(action)
+        self.thumbnail_card_action.setChecked(
+            self._card_view_mode == THUMBNAIL_VIEW
+        )
+        self.landscape_card_action.setChecked(
+            self._card_view_mode == LANDSCAPE_VIEW
+        )
+        self.thumbnail_card_action.triggered.connect(
+            lambda checked: checked
+            and self._set_card_view_mode(THUMBNAIL_VIEW)
+        )
+        self.landscape_card_action.triggered.connect(
+            lambda checked: checked
+            and self._set_card_view_mode(LANDSCAPE_VIEW)
+        )
+        view_menu.addSeparator()
         tab_settings = view_menu.addAction("表示タブの設定")
         tab_settings.triggered.connect(self._show_display_tab_settings)
         reset_tabs = view_menu.addAction("表示を初期状態に戻す")
@@ -379,9 +431,18 @@ class MainWindow(QMainWindow):
             self.metadata_pane.set_optional_tab_visible(key, visible)
 
     def _reset_display_layout(self) -> None:
-        """ウィンドウ内容を保ったまま左右・上下分割だけを既定値へ戻す。"""
+        """分割位置とカード表示形式を初期状態へ戻す。"""
         self.splitter.setSizes(PAGE_SPLITTER_SIZES)
         self.detail_splitter.setSizes(DETAIL_SPLITTER_SIZES)
+        self._set_card_view_mode(THUMBNAIL_VIEW)
+
+    def _set_card_view_mode(self, mode: str) -> None:
+        self._card_view_mode = mode
+        self.thumbnail_card_action.setChecked(mode == THUMBNAIL_VIEW)
+        self.landscape_card_action.setChecked(mode == LANDSCAPE_VIEW)
+        self.file_list_pane.set_view_mode(mode)
+        self.settings.setValue(CARD_VIEW_MODE_KEY, mode)
+        self.settings.sync()
 
     def _show_about(self) -> None:
         QMessageBox.information(
@@ -393,7 +454,7 @@ class MainWindow(QMainWindow):
 
     def _show_version(self) -> None:
         QMessageBox.information(
-            self, "バージョン情報", "METAMI Ver1.0.4"
+            self, "バージョン情報", "METAMI Ver1.0.5"
         )
 
     def _show_ltx_video_tips(self) -> None:
