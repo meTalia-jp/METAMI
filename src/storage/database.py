@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from storage.schema_version import METAMI_SCHEMA_VERSION
 
+
+# 既存の内部テーブル初期化・移行処理用。中央DB全体の互換性番号とは別。
 SCHEMA_VERSION = 3
 DEFAULT_DATABASE_PATH = Path(__file__).resolve().parents[2] / "data" / "metami.db"
 
@@ -53,6 +56,17 @@ class MetadataDatabase:
 
     def initialize(self) -> None:
         """DBを作成し、必要なマイグレーションを順番に適用する。"""
+        database_existed = self.path.exists()
+        if database_existed:
+            try:
+                if not self.path.is_file() or self.path.stat().st_size <= 0:
+                    raise DatabaseError(
+                        "既存のデータベースが空か、通常のファイルではありません。"
+                    )
+            except OSError as error:
+                raise DatabaseError(
+                    f"既存のデータベースを確認できません: {error}"
+                ) from error
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self._connect() as connection:
@@ -87,6 +101,41 @@ class MetadataDatabase:
                         connection.execute("BEGIN IMMEDIATE")
                     self._migrate_to_v2(connection)
                     self._migrate_to_v3(connection)
+                if not database_existed:
+                    required = {"files", "user_info", "tags", "file_tags"}
+                    tables = {
+                        str(row[0])
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        )
+                    }
+                    missing = required - tables
+                    if missing:
+                        raise sqlite3.DatabaseError(
+                            "新規DBの主要テーブルを確認できません。"
+                        )
+                    quick_rows = connection.execute(
+                        "PRAGMA quick_check"
+                    ).fetchall()
+                    quick_result = "\n".join(
+                        str(row[0]) for row in quick_rows
+                    )
+                    if quick_result.casefold() != "ok":
+                        raise sqlite3.DatabaseError(
+                            f"新規DBの整合性確認に失敗しました: {quick_result}"
+                        )
+                    connection.execute(
+                        f"PRAGMA user_version = {METAMI_SCHEMA_VERSION}"
+                    )
+                    row = connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()
+                    if row is None or int(row[0]) != METAMI_SCHEMA_VERSION:
+                        raise sqlite3.DatabaseError(
+                            "新規DBのスキーマ情報を登録できません。"
+                        )
+        except DatabaseError:
+            raise
         except (OSError, sqlite3.Error) as error:
             raise DatabaseError(f"データベースを初期化できません: {error}") from error
 

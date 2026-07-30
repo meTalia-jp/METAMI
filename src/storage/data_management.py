@@ -10,6 +10,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from storage.schema_version import (
+    METAMI_SCHEMA_VERSION,
+    SchemaVersionError,
+    check_schema_compatibility,
+    get_user_version,
+)
+
 
 REQUIRED_METAMI_TABLES = frozenset(
     {"files", "user_info", "tags", "file_tags"}
@@ -36,6 +43,9 @@ class DatabaseInfo:
     sqlite_version: str
     integrity_ok: bool
     integrity_details: str
+    schema_version: int
+    supported_schema_version: int
+    compatibility_status: str
 
 
 @dataclass(frozen=True)
@@ -110,6 +120,18 @@ def validate_restore_source(source_path: Path, current_path: Path) -> str:
     """復元元の内容と、使用中DBとは別実体であることを確認する。"""
     integrity = validate_metami_database(source_path)
     _ensure_distinct_paths(Path(source_path), Path(current_path))
+    try:
+        version = get_user_version(Path(source_path))
+    except SchemaVersionError as error:
+        raise DataManagementError(str(error)) from error
+    compatibility = check_schema_compatibility(version)
+    if version > METAMI_SCHEMA_VERSION:
+        raise DataManagementError(
+            "選択したMETAMIデータは、より新しいバージョンで"
+            "作成または更新されています。\n"
+            f"METAMI対応スキーマ: {METAMI_SCHEMA_VERSION}\n"
+            f"復元元DBスキーマ: {compatibility.database_version}"
+        )
     return integrity
 
 
@@ -161,6 +183,11 @@ def restore_database(
     try:
         _backup_into_database(source, current)
         validate_metami_database(current)
+        if get_user_version(current) < METAMI_SCHEMA_VERSION:
+            # 復元確認と復元前退避は完了済み。旧DBだけ同じ段階更新を適用する。
+            from storage.migrations.manager import migrate_database
+
+            migrate_database(current, now=now)
     except Exception as restore_error:
         try:
             _backup_into_database(before_restore, current)
@@ -207,6 +234,8 @@ def get_database_info(path: Path) -> DatabaseInfo:
             sqlite_version = str(
                 connection.execute("SELECT sqlite_version()").fetchone()[0]
             )
+            schema_version = get_user_version(database_path)
+            compatibility = check_schema_compatibility(schema_version)
     except (OSError, sqlite3.Error) as error:
         raise DataManagementError(
             f"データベース情報を取得できません: {error}"
@@ -224,6 +253,9 @@ def get_database_info(path: Path) -> DatabaseInfo:
         sqlite_version=sqlite_version,
         integrity_ok=integrity.casefold() == "ok",
         integrity_details=integrity,
+        schema_version=schema_version,
+        supported_schema_version=METAMI_SCHEMA_VERSION,
+        compatibility_status=compatibility.status,
     )
 
 
@@ -256,7 +288,8 @@ def _atomic_sqlite_backup(source: Path, destination: Path) -> Path:
                 pass
 
 
-def _backup_into_database(source: Path, destination: Path) -> None:
+def copy_database_over(source: Path, destination: Path) -> None:
+    """SQLiteバックアップAPIでDB全体を指定先へコピーする。"""
     try:
         with _read_only_connection(source) as source_connection:
             with closing(
@@ -283,7 +316,7 @@ def _read_only_connection(path: Path):
     return closing(sqlite3.connect(uri, uri=True, timeout=10))
 
 
-def _quick_check(connection: sqlite3.Connection) -> str:
+def quick_check(connection: sqlite3.Connection) -> str:
     rows = connection.execute("PRAGMA quick_check").fetchall()
     return "\n".join(str(row[0]) for row in rows) if rows else "結果なし"
 
@@ -320,7 +353,7 @@ def _ensure_writable_destination(destination: Path) -> None:
         raise DataManagementError("選択した保存先へ書き込めません。")
 
 
-def _available_backup_path(directory: Path, file_name: str) -> Path:
+def available_backup_path(directory: Path, file_name: str) -> Path:
     candidate = directory / file_name
     if not candidate.exists():
         return candidate
@@ -330,3 +363,9 @@ def _available_backup_path(directory: Path, file_name: str) -> Path:
         if not numbered.exists():
             return numbered
     raise DataManagementError("復元前退避ファイル名を確保できません。")
+
+
+# Ver1.0.6内部名との互換性を保ち、既存テストと呼び出しを壊さない。
+_quick_check = quick_check
+_backup_into_database = copy_database_over
+_available_backup_path = available_backup_path

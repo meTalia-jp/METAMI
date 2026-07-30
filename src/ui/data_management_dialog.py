@@ -52,6 +52,12 @@ class DatabaseInfoDialog(QDialog):
             ("タグ登録項目数", f"{info.tagged_files}件"),
             ("メモ登録項目数", f"{info.memo_files}件"),
             ("評価登録項目数", f"{info.rated_files}件"),
+            ("DBスキーマバージョン", str(info.schema_version)),
+            (
+                "METAMI対応スキーマ",
+                str(info.supported_schema_version),
+            ),
+            ("互換性", info.compatibility_status),
             ("SQLiteバージョン", info.sqlite_version),
             (
                 "整合性確認結果",
