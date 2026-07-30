@@ -6,10 +6,11 @@ import os
 import random
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QSize, QTimer, Qt
+from PySide6.QtCore import QSettings, QSize, QTimer, Qt, QUrl
 from PySide6.QtGui import (
     QActionGroup,
     QColor,
+    QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
     QPainter,
@@ -35,6 +36,20 @@ from metadata.media_finder import (
     find_media_files,
 )
 from storage.database import DatabaseError, MetadataDatabase
+from storage.data_management import (
+    DataManagementError,
+    backup_database,
+    get_database_info,
+    restore_database,
+    timestamped_database_name,
+    validate_metami_database,
+    validate_restore_source,
+    with_database_suffix,
+)
+from ui.data_management_dialog import (
+    DatabaseInfoDialog,
+    DataManagementHelpDialog,
+)
 from ui.file_list_pane import (
     LANDSCAPE_VIEW,
     THUMBNAIL_VIEW,
@@ -220,6 +235,7 @@ class MainWindow(QMainWindow):
         )
         self._current_folder: Path | None = None
         self._current_path: Path | None = None
+        self._data_operation_in_progress = False
         self._ignore_next_file_signal = False
         self._rating_prompted_paths: set[str] = set()
         self._rating_appeal_path_key = ""
@@ -410,6 +426,37 @@ class MainWindow(QMainWindow):
         tab_settings.triggered.connect(self._show_display_tab_settings)
         reset_tabs = view_menu.addAction("表示を初期状態に戻す")
         reset_tabs.triggered.connect(self._reset_display_layout)
+        data_menu = self.menuBar().addMenu("データ管理(&D)")
+        self.data_menu = data_menu
+        self.backup_data_action = data_menu.addAction(
+            "METAMIデータをバックアップ…"
+        )
+        self.restore_data_action = data_menu.addAction(
+            "METAMIデータを復元…"
+        )
+        data_menu.addSeparator()
+        self.open_data_location_action = data_menu.addAction(
+            "データ保存場所を開く"
+        )
+        self.database_info_action = data_menu.addAction(
+            "データベース情報…"
+        )
+        data_actions = (
+            self.backup_data_action,
+            self.restore_data_action,
+            self.open_data_location_action,
+            self.database_info_action,
+        )
+        for action in data_actions:
+            action.setEnabled(self.database is not None)
+        self.backup_data_action.triggered.connect(self._backup_metami_data)
+        self.restore_data_action.triggered.connect(self._restore_metami_data)
+        self.open_data_location_action.triggered.connect(
+            self._open_data_location
+        )
+        self.database_info_action.triggered.connect(
+            self._show_database_info
+        )
         help_menu = self.menuBar().addMenu("ヘルプ(&H)")
         self.help_menu = help_menu
         about = help_menu.addAction("METAMIについて")
@@ -420,6 +467,10 @@ class MainWindow(QMainWindow):
         self.creation_notes_menu = creation_notes
         ltx_video_tips = creation_notes.addAction("LTX動画作成メモ")
         ltx_video_tips.triggered.connect(self._show_ltx_video_tips)
+        data_help = help_menu.addAction(
+            "METAMIデータのバックアップと復元"
+        )
+        data_help.triggered.connect(self._show_data_management_help)
 
     def _show_display_tab_settings(self) -> None:
         dialog = DisplayTabSettingsDialog(
@@ -454,12 +505,241 @@ class MainWindow(QMainWindow):
 
     def _show_version(self) -> None:
         QMessageBox.information(
-            self, "バージョン情報", "METAMI Ver1.0.5"
+            self, "バージョン情報", "METAMI Ver1.0.6"
         )
 
     def _show_ltx_video_tips(self) -> None:
         dialog = LtxVideoTipsDialog(self)
         dialog.exec()
+
+    def _show_data_management_help(self) -> None:
+        dialog = DataManagementHelpDialog(self)
+        dialog.exec()
+
+    def _backup_metami_data(self) -> None:
+        database = self.database
+        if database is None:
+            self._show_data_management_error(
+                "METAMIデータを利用できないため、バックアップできません。"
+            )
+            return
+        QMessageBox.information(
+            self,
+            "METAMIデータのバックアップ",
+            "METAMIデータには、タイトル、星評価、タグ、メモなどの\n"
+            "登録情報が保存されています。\n\n"
+            "画像・動画ファイル本体はバックアップ対象に含まれません。",
+        )
+        selected, _filter = QFileDialog.getSaveFileName(
+            self,
+            "METAMIデータのバックアップ先を選択",
+            timestamped_database_name(),
+            "METAMIデータベース (*.db);;すべてのファイル (*.*)",
+        )
+        if not selected:
+            return
+        destination = with_database_suffix(Path(selected))
+        self._set_status("METAMIデータを確認しています…", "active")
+        self._set_data_operation_active(True)
+        try:
+            self._set_status("バックアップを作成しています…", "active")
+            saved_path = backup_database(database.path, destination)
+        except DataManagementError as error:
+            self._set_status("バックアップを作成できませんでした", "error")
+            QMessageBox.warning(
+                self,
+                "バックアップに失敗しました",
+                "METAMIデータのバックアップ作成に失敗しました。\n\n"
+                f"保存先:\n{destination}\n\n"
+                "元のMETAMIデータは変更されていません。\n\n"
+                f"詳細:\n{error}",
+            )
+            return
+        finally:
+            self._set_data_operation_active(False)
+        self._set_status("バックアップが完了しました", "active")
+        QMessageBox.information(
+            self,
+            "バックアップ完了",
+            "METAMIデータのバックアップを作成しました。\n\n"
+            f"保存先:\n{saved_path}\n\n"
+            "このバックアップには、タイトル、評価、タグ、メモなどの\n"
+            "METAMI登録情報が含まれます。\n"
+            "画像・動画ファイル本体は含まれません。",
+        )
+
+    def _restore_metami_data(self) -> None:
+        database = self.database
+        if database is None:
+            self._show_data_management_error(
+                "METAMIデータを利用できないため、復元できません。"
+            )
+            return
+        if not self._resolve_unsaved_memo():
+            return
+        selected, _filter = QFileDialog.getOpenFileName(
+            self,
+            "復元するMETAMIデータを選択",
+            "",
+            "METAMIデータベース (*.db);;すべてのファイル (*.*)",
+        )
+        if not selected:
+            return
+        source = Path(selected)
+        self._set_status("復元元を確認しています…", "active")
+        try:
+            validate_restore_source(source, database.path)
+        except DataManagementError as error:
+            self._set_status("復元元を確認できませんでした", "error")
+            QMessageBox.warning(
+                self,
+                "復元できません",
+                "選択したファイルは、METAMIデータとして確認できませんでした。\n"
+                "復元は行われていません。\n\n"
+                f"詳細:\n{error}",
+            )
+            return
+        if not self._confirm_database_restore():
+            self._set_status("復元をキャンセルしました", "ready")
+            return
+
+        selected_path = self._current_path
+        self._set_data_operation_active(True)
+        try:
+            self._set_status("復元前データを退避しています…", "active")
+            self._set_status("METAMIデータを復元しています…", "active")
+            result = restore_database(source, database.path)
+        except DataManagementError as error:
+            try:
+                validate_metami_database(database.path)
+            except DataManagementError:
+                self._set_database_state("error")
+            else:
+                self._set_database_state("online")
+            self._set_status("METAMIデータを復元できませんでした", "error")
+            QMessageBox.warning(
+                self,
+                "復元に失敗しました",
+                f"{error}\n\n画像・動画ファイル本体は変更されていません。",
+            )
+            return
+        finally:
+            self._set_data_operation_active(False)
+
+        self._set_database_state("online")
+        self._reload_after_database_restore(selected_path)
+        self._set_status("復元が完了しました", "active")
+        QMessageBox.information(
+            self,
+            "復元完了",
+            "METAMIデータを復元しました。\n\n"
+            f"復元元:\n{result.source_path}\n\n"
+            f"復元前のデータ:\n{result.before_restore_path}\n\n"
+            "画像・動画ファイル本体は変更されていません。",
+        )
+
+    def _confirm_database_restore(self) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle("METAMIデータの復元")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText("METAMIデータを復元します。")
+        box.setInformativeText(
+            "現在のタイトル、星評価、タグ、メモなどの登録情報は、\n"
+            "選択したバックアップの内容に置き換わります。\n\n"
+            "画像・動画ファイル本体は変更されません。\n\n"
+            "復元前に、現在のMETAMIデータを自動的に退避します。\n"
+            "復元後は一覧と詳細表示を更新します。\n\n"
+            "続行しますか？"
+        )
+        restore_button = box.addButton(
+            "復元する", QMessageBox.ButtonRole.AcceptRole
+        )
+        cancel_button = box.addButton(
+            "キャンセル", QMessageBox.ButtonRole.RejectRole
+        )
+        box.setDefaultButton(cancel_button)
+        box.setEscapeButton(cancel_button)
+        box.exec()
+        return box.clickedButton() is restore_button
+
+    def _reload_after_database_restore(
+        self, selected_path: Path | None
+    ) -> None:
+        if self._current_folder is not None:
+            folder = self._current_folder
+            if self._open_folder(
+                folder,
+                add_to_history=False,
+                resolve_unsaved=False,
+                select_first=False,
+            ):
+                if (
+                    selected_path is not None
+                    and self.file_list_pane.select_path(selected_path)
+                ):
+                    return
+            self._current_path = None
+            self.preview_pane.clear("ファイルを選択してください。")
+            self.metadata_pane.clear()
+            return
+        if selected_path is not None and selected_path.is_file():
+            self._set_paths([selected_path], select_first=False)
+            if self.file_list_pane.select_path(selected_path):
+                return
+        self._current_path = None
+        self.file_list_pane.clear()
+        self.preview_pane.clear("ファイルを選択してください。")
+        self.metadata_pane.clear()
+
+    def _open_data_location(self) -> None:
+        database = self.database
+        if database is None:
+            self._show_data_management_error(
+                "METAMIデータの保存場所を確認できません。"
+            )
+            return
+        folder = database.path.parent
+        if not folder.exists() or not folder.is_dir():
+            self._show_data_management_error(
+                "METAMIデータの保存フォルダが見つかりません。"
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve()))):
+            self._show_data_management_error(
+                "METAMIデータの保存場所を開けませんでした。"
+            )
+
+    def _show_database_info(self) -> None:
+        database = self.database
+        if database is None:
+            self._show_data_management_error(
+                "データベース情報を確認できません。"
+            )
+            return
+        self._set_status("METAMIデータを確認しています…", "active")
+        try:
+            info = get_database_info(database.path)
+        except DataManagementError as error:
+            self._show_data_management_error(str(error))
+            return
+        self._set_status("データベース情報を確認しました", "ready")
+        dialog = DatabaseInfoDialog(info, self)
+        dialog.exec()
+
+    def _set_data_operation_active(self, active: bool) -> None:
+        self._data_operation_in_progress = active
+        enabled = self.database is not None and not active
+        for action in (
+            self.backup_data_action,
+            self.restore_data_action,
+            self.open_data_location_action,
+            self.database_info_action,
+        ):
+            action.setEnabled(enabled)
+
+    def _show_data_management_error(self, message: str) -> None:
+        self._set_status(message, "error")
+        QMessageBox.warning(self, "データ管理", message)
 
     def _show_missing_items(self) -> None:
         if self.database is None:
@@ -1258,6 +1538,9 @@ class MainWindow(QMainWindow):
         self.rating_appeal.clear_nudge()
 
     def closeEvent(self, event) -> None:
+        if self._data_operation_in_progress:
+            event.ignore()
+            return
         if not self._resolve_unsaved_memo():
             event.ignore()
             return
