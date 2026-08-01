@@ -274,7 +274,10 @@ class PreviewPane(QWidget):
         missing_layout.addLayout(details)
         missing_layout.addStretch(1)
         actions = QHBoxLayout()
-        self.locate_missing_button = QPushButton("ファイルを探す")
+        self.locate_missing_button = QPushButton("登録パスを変更")
+        self.locate_missing_button.setToolTip(
+            "利用者が選んだファイルへ、このDB記録の登録パスを変更します"
+        )
         self.locate_missing_button.setObjectName("missingAction")
         self.locate_missing_button.clicked.connect(self.locateMissingRequested.emit)
         self.delete_missing_button = QPushButton("METAMIの記録を削除")

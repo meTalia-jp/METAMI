@@ -221,7 +221,7 @@ class FileCard(StickyNoteFrame):
         name_row.addWidget(self.name_label, 1)
         self.missing_badge = QLabel("ファイルなし")
         self.missing_badge.setObjectName("missingBadge")
-        self.missing_badge.setToolTip("登録済みの原本ファイルが見つかりません")
+        self.missing_badge.setToolTip("登録された場所にファイルが見つかりません")
         self.missing_badge.hide()
         self.favorite_button = QToolButton()
         self.favorite_button.setObjectName("favoriteButton")
@@ -459,7 +459,7 @@ class FileCard(StickyNoteFrame):
         self.setProperty("missing", missing)
         self.missing_badge.setVisible(missing)
         self.details.setText(
-            "原本ファイルが見つかりません"
+            "登録された場所にファイルが見つかりません"
             if missing
             else self._available_details
         )
@@ -842,7 +842,7 @@ class FileListPane(QWidget):
             ("すべて", "all"),
         ):
             self.state_filter.addItem(label, value)
-        self.state_filter.setToolTip("原本ファイルの状態で絞り込み")
+        self.state_filter.setToolTip("登録された場所のファイル状態で絞り込み")
         self.reset_button = QToolButton()
         self.reset_button.setObjectName("searchReset")
         self.reset_button.setText("リセット")

@@ -349,6 +349,14 @@ class Ver109FileIdentityRegistrationTests(unittest.TestCase):
     def test_menu_terms_status_dialog_and_schema_are_stable(self) -> None:
         window = MainWindow(self.database, settings=self.settings)
         try:
+            self.assertEqual(
+                window.preview_pane.locate_missing_button.text(),
+                "登録パスを変更",
+            )
+            self.assertIn(
+                "DB記録の登録パスを変更",
+                window.preview_pane.locate_missing_button.toolTip(),
+            )
             actions = [action.text() for action in window.identity_menu.actions()]
             self.assertEqual(
                 actions,
@@ -380,6 +388,20 @@ class Ver109FileIdentityRegistrationTests(unittest.TestCase):
         finally:
             self._close(window)
 
+    def test_unreleased_design_does_not_rewrite_published_changelog(self) -> None:
+        text = (ROOT / "docs" / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## Unreleased", text)
+        self.assertIn("同じ内容のファイルへのMETAMIデータコピー", text)
+        self.assertIn(
+            "ハッシュ一致による再関連付け、自動パス更新、重複整理、miniDBは未実装",
+            text,
+        )
+        self.assertIn(
+            "ハッシュ一致だけでパス更新やレコード統合を行わず、"
+            "ハッシュを利用した再関連付けは未実装",
+            text,
+        )
+
     def test_help_describes_operation_and_safety(self) -> None:
         text = (SRC / "assets" / "help" / "data_management.md").read_text(
             encoding="utf-8"
@@ -393,7 +415,9 @@ class Ver109FileIdentityRegistrationTests(unittest.TestCase):
             "途中でキャンセル",
             "完了済み",
             "ファイル本体は変更されません",
-            "再関連付けや自動パス更新はまだ実装されていません",
+            "同じ内容のファイルへの",
+            "METAMIデータのコピー",
+            "見つからないファイルを探す専用機能は未実装です",
         ):
             self.assertIn(expected, text)
 

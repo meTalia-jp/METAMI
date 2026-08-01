@@ -1572,10 +1572,10 @@ class MainWindow(QMainWindow):
         if not path.is_file():
             self._refresh_missing_preview()
             self.metadata_pane.show_error(
-                "登録済みの原本ファイルが見つかりません。"
+                "登録された場所にファイルが見つかりません。"
             )
             self._set_status(
-                f"原本ファイルが見つかりません: {path}", "error"
+                f"登録された場所にファイルが見つかりません: {path}", "error"
             )
             return
         self.preview_pane.show_file(path)
@@ -1677,7 +1677,7 @@ class MainWindow(QMainWindow):
             details = self.database.get_missing_file_details(path)
         except DatabaseError as error:
             self._set_database_state("error")
-            self.preview_pane.clear("原本ファイルが見つかりません。")
+            self.preview_pane.clear("登録された場所にファイルが見つかりません。")
             self._set_status(f"missing記録を読み込めません: {error}", "error")
             return
         self.preview_pane.show_missing(
@@ -1690,16 +1690,16 @@ class MainWindow(QMainWindow):
         )
 
     def _locate_missing_file(self) -> None:
-        """ユーザーが選んだ代替ファイルへ、同じDB記録を付け替える。"""
+        """利用者が選んだファイルへ、既存DB記録の登録パスを変更する。"""
         old_path = self._current_path
         if old_path is None or old_path.is_file() or self.database is None:
-            self._set_status("関連付け対象のmissing記録がありません。", "error")
+            self._set_status("登録パスを変更するmissing記録がありません。", "error")
             return
         if not self._resolve_unsaved_memo():
             return
         selected, _ = QFileDialog.getOpenFileName(
             self,
-            "代替ファイルを選択",
+            "新しい登録先ファイルを選択",
             "",
             "対応ファイル (*.png *.webp *.jpg *.jpeg *.JPG *.JPEG *.mp4);;"
             "すべてのファイル (*)",
@@ -1710,17 +1710,19 @@ class MainWindow(QMainWindow):
         if not new_path.is_file() or new_path.suffix.lower() not in SUPPORTED_SUFFIXES:
             QMessageBox.warning(
                 self,
-                "ファイルを関連付けできません",
+                "登録パスを変更できません",
                 "PNG、WEBP、MP4の実在するファイルを選択してください。",
             )
             return
         answer = QMessageBox.question(
             self,
-            "新しいパスへ関連付け",
-            "次のファイルを、見つからない記録の新しい原本として関連付けますか？\n\n"
-            f"以前: {old_path}\n新しいファイル: {new_path}\n\n"
+            "登録パスを変更",
+            "見つからない記録の登録パスを、次のファイルへ変更しますか？\n\n"
+            f"現在の登録パス: {old_path}\n新しい登録先: {new_path}\n\n"
+            "この操作は既存のDB記録のパスを変更します。\n"
+            "フォルダやドライブの自動検索、別レコードへのデータコピーは行いません。\n"
             "保存済みのタイトル、評価、タグ、メモは維持されます。\n"
-            "METAMIは原本ファイルを変更しません。",
+            "METAMIは画像・動画ファイル本体を変更しません。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1730,8 +1732,8 @@ class MainWindow(QMainWindow):
             self.database.relink_missing_file(old_path, new_path)
         except DatabaseError as error:
             self._set_database_state("error")
-            QMessageBox.warning(self, "関連付けに失敗しました", str(error))
-            self._set_status(f"新しいパスへ関連付けできません: {error}", "error")
+            QMessageBox.warning(self, "登録パスの変更に失敗しました", str(error))
+            self._set_status(f"登録パスを変更できません: {error}", "error")
             return
         paths = [
             new_path if self._same_path(path, old_path) else path
@@ -1741,7 +1743,7 @@ class MainWindow(QMainWindow):
         self._set_database_state("online")
         self._set_paths(paths)
         self.file_list_pane.select_path(new_path)
-        self._set_status(f"新しいパスへ関連付けました: {new_path}", "active")
+        self._set_status(f"登録パスを変更しました: {new_path}", "active")
 
     def _delete_missing_record(self) -> None:
         """missing記録だけを、明示確認後にトランザクションで削除する。"""
