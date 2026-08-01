@@ -9,6 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from storage.file_hash import (
+    CURRENT_HASH_ALGORITHM,
+    FileHashResult,
+    HashStatus,
+    is_valid_hash,
+)
+from storage.migrations.v1_to_v2 import ensure_hash_columns
 from storage.schema_version import METAMI_SCHEMA_VERSION
 
 
@@ -46,6 +53,20 @@ class RegisteredFileRecord:
     rating: int
     tags: tuple[str, ...]
     memo: str
+
+
+@dataclass(frozen=True)
+class StoredFileHash:
+    """DBへ保存されたファイル識別情報。"""
+
+    path: str
+    content_hash: str | None
+    algorithm: str | None
+    status: HashStatus
+    calculated_at: str | None
+    file_size: int | None
+    modified_ns: int | None
+    error: str | None
 
 
 class MetadataDatabase:
@@ -102,6 +123,7 @@ class MetadataDatabase:
                     self._migrate_to_v2(connection)
                     self._migrate_to_v3(connection)
                 if not database_existed:
+                    ensure_hash_columns(connection)
                     required = {"files", "user_info", "tags", "file_tags"}
                     tables = {
                         str(row[0])
@@ -227,6 +249,177 @@ class MetadataDatabase:
             raise DatabaseError(
                 f"ファイル状態を確認できません: {error}"
             ) from error
+
+    def save_file_hash_result(self, result: FileHashResult) -> None:
+        """単体計算結果を登録済みファイルへトランザクション保存する。"""
+        path = str(result.path.resolve())
+        try:
+            with self._connect() as connection:
+                if result.status is HashStatus.CALCULATED:
+                    if (
+                        not result.success
+                        or result.algorithm != CURRENT_HASH_ALGORITHM
+                        or not is_valid_hash(result.digest, result.algorithm)
+                        or not result.calculated_at
+                        or result.file_size is None
+                        or result.file_size < 0
+                        or result.modified_ns is None
+                        or result.modified_ns < 0
+                    ):
+                        raise DatabaseError("保存するハッシュ計算結果が不正です。")
+                    values = (
+                        result.digest,
+                        result.algorithm,
+                        result.status.value,
+                        result.calculated_at,
+                        result.file_size,
+                        result.modified_ns,
+                        None,
+                        path,
+                    )
+                    cursor = connection.execute(
+                        """
+                        UPDATE files SET
+                            content_hash = ?, hash_algorithm = ?, hash_status = ?,
+                            hash_calculated_at = ?, hashed_file_size = ?,
+                            hashed_modified_ns = ?, hash_error = ?
+                        WHERE canonical_path = ?
+                        """,
+                        values,
+                    )
+                elif result.status in {HashStatus.MISSING, HashStatus.STALE}:
+                    cursor = connection.execute(
+                        """
+                        UPDATE files SET hash_status = ?, hash_error = ?
+                        WHERE canonical_path = ?
+                        """,
+                        (result.status.value, result.error, path),
+                    )
+                else:
+                    cursor = connection.execute(
+                        """
+                        UPDATE files SET
+                            content_hash = NULL,
+                            hash_algorithm = ?,
+                            hash_status = ?,
+                            hash_calculated_at = NULL,
+                            hashed_file_size = NULL,
+                            hashed_modified_ns = NULL,
+                            hash_error = ?
+                        WHERE canonical_path = ?
+                        """,
+                        (
+                            result.algorithm,
+                            result.status.value,
+                            result.error,
+                            path,
+                        ),
+                    )
+                if cursor.rowcount != 1:
+                    raise DatabaseError("ハッシュ保存対象がDBに登録されていません。")
+        except DatabaseError:
+            raise
+        except sqlite3.Error as error:
+            raise DatabaseError(f"ハッシュ情報を保存できません: {error}") from error
+
+    def get_file_hash(self, path: Path) -> StoredFileHash | None:
+        """保存済み情報を返し、不正なcalculated値はstaleとして扱う。"""
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT canonical_path, content_hash, hash_algorithm,
+                           hash_status, hash_calculated_at, hashed_file_size,
+                           hashed_modified_ns, hash_error
+                    FROM files WHERE canonical_path = ?
+                    """,
+                    (str(path.resolve()),),
+                ).fetchone()
+        except sqlite3.Error as error:
+            raise DatabaseError(f"ハッシュ情報を取得できません: {error}") from error
+        if row is None:
+            return None
+        try:
+            status = HashStatus(str(row[3]))
+        except ValueError:
+            status = HashStatus.STALE
+        if status is HashStatus.CALCULATED and not is_valid_hash(row[1], str(row[2])):
+            status = HashStatus.STALE
+        return StoredFileHash(
+            str(row[0]), row[1], row[2], status, row[4], row[5], row[6], row[7]
+        )
+
+    def refresh_file_hash_status(self, path: Path) -> HashStatus:
+        """サイズとmtime_nsだけでmissing・stale・現在状態を判定する。"""
+        stored = self.get_file_hash(path)
+        if stored is None:
+            raise DatabaseError("ハッシュ確認対象がDBに登録されていません。")
+        candidate = Path(path)
+        if not candidate.is_file():
+            status = HashStatus.MISSING
+        else:
+            try:
+                stat = candidate.stat()
+            except OSError:
+                status = HashStatus.MISSING
+            else:
+                if stored.status is HashStatus.MISSING:
+                    status = (
+                        HashStatus.STALE
+                        if stored.content_hash is not None
+                        else HashStatus.NOT_CALCULATED
+                    )
+                elif stored.status is HashStatus.CALCULATED and (
+                    stored.file_size != stat.st_size
+                    or stored.modified_ns != stat.st_mtime_ns
+                    or not is_valid_hash(stored.content_hash, stored.algorithm or "")
+                ):
+                    status = HashStatus.STALE
+                else:
+                    status = stored.status
+        if status is not stored.status:
+            error = (
+                "登録された場所にファイルが見つかりません。"
+                if status is HashStatus.MISSING
+                else None
+            )
+            try:
+                with self._connect() as connection:
+                    connection.execute(
+                        "UPDATE files SET hash_status = ?, hash_error = ? "
+                        "WHERE canonical_path = ?",
+                        (status.value, error, str(candidate.resolve())),
+                    )
+            except sqlite3.Error as exc:
+                raise DatabaseError(f"ハッシュ状態を更新できません: {exc}") from exc
+        return status
+
+    def find_hash_matches(
+        self,
+        digest: str,
+        *,
+        algorithm: str = CURRENT_HASH_ALGORITHM,
+        statuses: tuple[HashStatus, ...] = (HashStatus.CALCULATED,),
+    ) -> list[str]:
+        """一致候補のパスだけを返し、DBやファイルは変更しない。"""
+        if not is_valid_hash(digest, algorithm) or not statuses:
+            return []
+        allowed = tuple(dict.fromkeys(status.value for status in statuses))
+        placeholders = ",".join("?" for _status in allowed)
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT canonical_path FROM files
+                    WHERE content_hash = ? AND hash_algorithm = ?
+                      AND hash_status IN ({placeholders})
+                    ORDER BY canonical_path COLLATE NOCASE, id
+                    """,
+                    (digest, algorithm, *allowed),
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise DatabaseError(f"ハッシュ候補を検索できません: {error}") from error
+        return [str(row[0]) for row in rows]
 
     def get_file_missing_states(self) -> dict[str, bool]:
         """登録済みファイルの現在パスとmissing状態を返す。"""

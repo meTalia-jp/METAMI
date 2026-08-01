@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from storage.file_hash import (
+    CURRENT_HASH_ALGORITHM,
+    HashStatus,
+    is_valid_hash,
+)
 from storage.schema_version import (
     METAMI_SCHEMA_VERSION,
     SchemaVersionError,
@@ -46,6 +51,13 @@ class DatabaseInfo:
     schema_version: int
     supported_schema_version: int
     compatibility_status: str
+    standard_hash_algorithm: str
+    hash_calculated_files: int
+    hash_not_calculated_files: int
+    hash_stale_files: int
+    hash_failed_files: int
+    hash_missing_files: int
+    hash_unknown_files: int
 
 
 @dataclass(frozen=True)
@@ -236,6 +248,9 @@ def get_database_info(path: Path) -> DatabaseInfo:
             )
             schema_version = get_user_version(database_path)
             compatibility = check_schema_compatibility(schema_version)
+            hash_rows = connection.execute(
+                "SELECT hash_status, content_hash, hash_algorithm FROM files"
+            ).fetchall()
     except (OSError, sqlite3.Error) as error:
         raise DataManagementError(
             f"データベース情報を取得できません: {error}"
@@ -256,6 +271,38 @@ def get_database_info(path: Path) -> DatabaseInfo:
         schema_version=schema_version,
         supported_schema_version=METAMI_SCHEMA_VERSION,
         compatibility_status=compatibility.status,
+        standard_hash_algorithm=CURRENT_HASH_ALGORITHM,
+        hash_calculated_files=sum(
+            1
+            for status, digest, algorithm in hash_rows
+            if status == HashStatus.CALCULATED.value
+            and is_valid_hash(digest, str(algorithm))
+        ),
+        hash_not_calculated_files=sum(
+            1 for status, _digest, _algorithm in hash_rows
+            if status == HashStatus.NOT_CALCULATED.value
+        ),
+        hash_stale_files=sum(
+            1 for status, _digest, _algorithm in hash_rows
+            if status == HashStatus.STALE.value
+        ),
+        hash_failed_files=sum(
+            1 for status, _digest, _algorithm in hash_rows
+            if status == HashStatus.FAILED.value
+        ),
+        hash_missing_files=sum(
+            1 for status, _digest, _algorithm in hash_rows
+            if status == HashStatus.MISSING.value
+        ),
+        hash_unknown_files=sum(
+            1
+            for status, digest, algorithm in hash_rows
+            if status not in {member.value for member in HashStatus}
+            or (
+                status == HashStatus.CALCULATED.value
+                and not is_valid_hash(digest, str(algorithm))
+            )
+        ),
     )
 
 

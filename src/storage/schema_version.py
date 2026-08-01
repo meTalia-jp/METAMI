@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 # 中央METAMI DB全体の互換性判定用。PRAGMA user_versionと対応する。
-METAMI_SCHEMA_VERSION = 1
+METAMI_SCHEMA_VERSION = 2
 
 SCHEMA_COMPATIBLE = "正常"
 SCHEMA_UPDATE_REQUIRED = "更新が必要"

@@ -35,8 +35,8 @@ class DatabaseInfoDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("データベース情報")
         self.setObjectName("databaseInfoDialog")
-        self.resize(620, 440)
-        self.setMinimumWidth(520)
+        self.resize(620, 620)
+        self.setMinimumSize(520, 560)
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
@@ -58,6 +58,13 @@ class DatabaseInfoDialog(QDialog):
                 str(info.supported_schema_version),
             ),
             ("互換性", info.compatibility_status),
+            ("標準ハッシュ方式", info.standard_hash_algorithm),
+            ("ハッシュ計算済み", f"{info.hash_calculated_files}件"),
+            ("未計算", f"{info.hash_not_calculated_files}件"),
+            ("再計算が必要", f"{info.hash_stale_files}件"),
+            ("計算失敗", f"{info.hash_failed_files}件"),
+            ("見つからない", f"{info.hash_missing_files}件"),
+            ("不明なハッシュ状態", f"{info.hash_unknown_files}件"),
             ("SQLiteバージョン", info.sqlite_version),
             (
                 "整合性確認結果",

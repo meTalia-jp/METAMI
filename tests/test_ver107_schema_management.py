@@ -109,8 +109,8 @@ class Ver107SchemaManagementTests(unittest.TestCase):
 
     def test_new_database_is_schema_one_and_valid(self) -> None:
         database = self._database()
-        self.assertEqual(METAMI_SCHEMA_VERSION, 1)
-        self.assertEqual(get_user_version(database.path), 1)
+        self.assertEqual(METAMI_SCHEMA_VERSION, 2)
+        self.assertEqual(get_user_version(database.path), 2)
         self.assertEqual(validate_metami_database(database.path), "ok")
 
     def test_schema_versions_are_classified_without_writes(self) -> None:
@@ -120,10 +120,10 @@ class Ver107SchemaManagementTests(unittest.TestCase):
             check_schema_compatibility(0).status, SCHEMA_UPDATE_REQUIRED
         )
         self.assertEqual(
-            check_schema_compatibility(1).status, SCHEMA_COMPATIBLE
+            check_schema_compatibility(1).status, SCHEMA_UPDATE_REQUIRED
         )
         self.assertEqual(
-            check_schema_compatibility(2).status, SCHEMA_TOO_NEW
+            check_schema_compatibility(2).status, SCHEMA_COMPATIBLE
         )
         with self.assertRaises(SchemaVersionError):
             check_schema_compatibility(-1)
@@ -146,6 +146,7 @@ class Ver107SchemaManagementTests(unittest.TestCase):
 
         result = migrate_database(
             database.path,
+            target_version=1,
             now=datetime(2026, 7, 30, 17, 50, 0),
         )
 
@@ -175,7 +176,7 @@ class Ver107SchemaManagementTests(unittest.TestCase):
             side_effect=DataManagementError("バックアップ不可"),
         ):
             with self.assertRaises(MigrationError):
-                migrate_database(database.path)
+                migrate_database(database.path, target_version=1)
         self.assertEqual(get_user_version(database.path), 0)
         self.assertEqual(before, database.path.read_bytes())
 
@@ -192,7 +193,7 @@ class Ver107SchemaManagementTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 MigrationError, "更新前のデータへ戻しました"
             ) as raised:
-                migrate_database(database.path)
+                migrate_database(database.path, target_version=1)
         self.assertIsNotNone(raised.exception.backup_path)
         self.assertEqual(get_user_version(database.path), 0)
         self.assertEqual(before, self._data_snapshot(database.path))
@@ -208,12 +209,12 @@ class Ver107SchemaManagementTests(unittest.TestCase):
 
     def test_too_new_database_is_rejected_without_modification(self) -> None:
         database = self._database()
-        self._set_version(database.path, 2)
+        self._set_version(database.path, 3)
         before = database.path.read_bytes()
         with patch("main.QMessageBox.critical") as critical:
             self.assertFalse(app_main.prepare_database(database))
         self.assertTrue(critical.called)
-        self.assertEqual(get_user_version(database.path), 2)
+        self.assertEqual(get_user_version(database.path), 3)
         self.assertEqual(before, database.path.read_bytes())
         with self.assertRaises(DataManagementError):
             validate_restore_source(database.path, self.root / "current.db")
@@ -235,40 +236,50 @@ class Ver107SchemaManagementTests(unittest.TestCase):
             patch("main.QMessageBox.information"),
         ):
             self.assertTrue(app_main.prepare_database(database))
-        self.assertEqual(get_user_version(database.path), 1)
+        self.assertEqual(get_user_version(database.path), 2)
         backups = list(
             (database.path.parent / "backups").glob(
                 "metami_before_migration_v0_to_v1_*.db"
             )
         )
         self.assertEqual(len(backups), 1)
+        self.assertEqual(
+            len(
+                list(
+                    (database.path.parent / "backups").glob(
+                        "metami_before_migration_v1_to_v2_*.db"
+                    )
+                )
+            ),
+            1,
+        )
         before_second_start = database.path.read_bytes()
         with patch("main.confirm_schema_update") as confirm:
             self.assertTrue(app_main.prepare_database(database))
         confirm.assert_not_called()
         self.assertEqual(before_second_start, database.path.read_bytes())
         self.assertEqual(
-            len(list((database.path.parent / "backups").glob("*.db"))), 1
+            len(list((database.path.parent / "backups").glob("*.db"))), 2
         )
 
     def test_manual_backup_preserves_schema_version(self) -> None:
         database = self._database()
         destination = self.root / "manual.db"
         backup_database(database.path, destination)
-        self.assertEqual(get_user_version(destination), 1)
+        self.assertEqual(get_user_version(destination), 2)
 
     def test_restore_schema_one_and_migrate_schema_zero(self) -> None:
         current = self._database("current.db")
         schema_one = self.root / "schema-one.db"
         backup_database(current.path, schema_one)
         restore_database(schema_one, current.path)
-        self.assertEqual(get_user_version(current.path), 1)
+        self.assertEqual(get_user_version(current.path), 2)
 
         schema_zero = self.root / "schema-zero.db"
         backup_database(current.path, schema_zero)
         self._set_version(schema_zero, 0)
         restore_database(schema_zero, current.path)
-        self.assertEqual(get_user_version(current.path), 1)
+        self.assertEqual(get_user_version(current.path), 2)
         self.assertTrue(
             list(
                 (current.path.parent / "backups").glob(
@@ -287,16 +298,16 @@ class Ver107SchemaManagementTests(unittest.TestCase):
     def test_database_info_and_dialog_show_schema_compatibility(self) -> None:
         database = self._database()
         info = get_database_info(database.path)
-        self.assertEqual(info.schema_version, 1)
-        self.assertEqual(info.supported_schema_version, 1)
+        self.assertEqual(info.schema_version, 2)
+        self.assertEqual(info.supported_schema_version, 2)
         self.assertEqual(info.compatibility_status, SCHEMA_COMPATIBLE)
         dialog = DatabaseInfoDialog(info)
         try:
             self.assertEqual(
-                dialog.value_labels["DBスキーマバージョン"].text(), "1"
+                dialog.value_labels["DBスキーマバージョン"].text(), "2"
             )
             self.assertEqual(
-                dialog.value_labels["METAMI対応スキーマ"].text(), "1"
+                dialog.value_labels["METAMI対応スキーマ"].text(), "2"
             )
             self.assertEqual(dialog.value_labels["互換性"].text(), "正常")
         finally:

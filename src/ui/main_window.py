@@ -505,7 +505,7 @@ class MainWindow(QMainWindow):
 
     def _show_version(self) -> None:
         QMessageBox.information(
-            self, "バージョン情報", "METAMI Ver1.0.7"
+            self, "バージョン情報", "METAMI Ver1.0.8"
         )
 
     def _show_ltx_video_tips(self) -> None:

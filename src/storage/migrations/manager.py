@@ -16,6 +16,7 @@ from storage.schema_version import (
     get_user_version,
 )
 from storage.migrations.v0_to_v1 import migrate_v0_to_v1
+from storage.migrations.v1_to_v2 import migrate_v1_to_v2
 
 
 class MigrationError(RuntimeError):
@@ -47,11 +48,15 @@ class MigrationResult:
     from_version: int
     to_version: int
     backup_path: Path | None
+    backup_paths: tuple[Path, ...] = ()
     error_details: str = ""
 
 
 MigrationStep = Callable[[sqlite3.Connection], None]
-MIGRATIONS: dict[int, MigrationStep] = {0: migrate_v0_to_v1}
+MIGRATIONS: dict[int, MigrationStep] = {
+    0: migrate_v0_to_v1,
+    1: migrate_v1_to_v2,
+}
 
 
 def migrate_database(
@@ -102,15 +107,11 @@ def migrate_database(
         if backup_directory is not None
         else database_path.parent / "backups"
     )
+    current_version = original_version
+    completed_backups: list[Path] = []
     try:
         backups.mkdir(parents=True, exist_ok=True)
-        name = data_management.timestamped_database_name(
-            f"metami_before_migration_v{original_version}_to_v{target_version}",
-            now,
-        )
-        backup_path = data_management.available_backup_path(backups, name)
-        data_management.backup_database(database_path, backup_path)
-    except (OSError, data_management.DataManagementError) as error:
+    except OSError as error:
         raise MigrationError(
             f"更新前のMETAMIデータをバックアップできません: {error}",
             from_version=original_version,
@@ -118,16 +119,30 @@ def migrate_database(
             migration_error=error,
         ) from error
 
-    current_version = original_version
-    try:
-        with closing(
-            sqlite3.connect(database_path, timeout=10)
-        ) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                while current_version < target_version:
+    while current_version < target_version:
+        next_version = current_version + 1
+        try:
+            name = data_management.timestamped_database_name(
+                f"metami_before_migration_v{current_version}_to_v{next_version}",
+                now,
+            )
+            backup_path = data_management.available_backup_path(backups, name)
+            data_management.backup_database(database_path, backup_path)
+        except data_management.DataManagementError as error:
+            raise MigrationError(
+                f"更新前のMETAMIデータをバックアップできません: {error}",
+                from_version=current_version,
+                to_version=next_version,
+                migration_error=error,
+            ) from error
+
+        try:
+            with closing(
+                sqlite3.connect(database_path, timeout=10)
+            ) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
                     MIGRATIONS[current_version](connection)
-                    next_version = current_version + 1
                     row = connection.execute("PRAGMA user_version").fetchone()
                     if row is None or int(row[0]) != next_version:
                         raise sqlite3.DatabaseError(
@@ -139,41 +154,42 @@ def migrate_database(
                             "更新後の整合性確認に失敗しました: "
                             f"{quick_check}"
                         )
-                    current_version = next_version
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
-        data_management.validate_metami_database(database_path)
-        final_version = get_user_version(database_path)
-        if final_version != target_version:
-            raise sqlite3.DatabaseError(
-                f"更新後のDBスキーマが不正です: {final_version}"
-            )
-    except Exception as migration_error:
-        try:
-            data_management.copy_database_over(backup_path, database_path)
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
             data_management.validate_metami_database(database_path)
-        except Exception as recovery_error:
+            if get_user_version(database_path) != next_version:
+                raise sqlite3.DatabaseError(
+                    f"更新後のDBスキーマが不正です: {get_user_version(database_path)}"
+                )
+        except Exception as migration_error:
+            try:
+                data_management.copy_database_over(backup_path, database_path)
+                data_management.validate_metami_database(database_path)
+            except Exception as recovery_error:
+                raise MigrationError(
+                    "METAMIデータの更新と自動回復の両方に失敗しました。",
+                    from_version=current_version,
+                    to_version=next_version,
+                    backup_path=backup_path.resolve(),
+                    migration_error=migration_error,
+                    recovery_error=recovery_error,
+                ) from recovery_error
             raise MigrationError(
-                "METAMIデータの更新と自動回復の両方に失敗しました。",
-                from_version=original_version,
-                to_version=target_version,
+                "METAMIデータの更新に失敗しましたが、更新前のデータへ戻しました。",
+                from_version=current_version,
+                to_version=next_version,
                 backup_path=backup_path.resolve(),
                 migration_error=migration_error,
-                recovery_error=recovery_error,
-            ) from recovery_error
-        raise MigrationError(
-            "METAMIデータの更新に失敗しましたが、更新前のデータへ戻しました。",
-            from_version=original_version,
-            to_version=target_version,
-            backup_path=backup_path.resolve(),
-            migration_error=migration_error,
-        ) from migration_error
+            ) from migration_error
+        completed_backups.append(backup_path.resolve())
+        current_version = next_version
 
     return MigrationResult(
         True,
         original_version,
         target_version,
-        backup_path.resolve(),
+        completed_backups[-1] if completed_backups else None,
+        tuple(completed_backups),
     )
