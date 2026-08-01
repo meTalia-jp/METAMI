@@ -29,6 +29,19 @@ class HashStatus(StrEnum):
     MISSING = "missing"
 
 
+# 手動一括登録で処理する状態。利用者向け設定にはせず、対象範囲はここで一元管理する。
+BULK_REGISTRATION_STATUSES = frozenset({
+    HashStatus.NOT_CALCULATED,
+    HashStatus.STALE,
+    HashStatus.FAILED,
+})
+
+
+def is_bulk_registration_status(status: HashStatus | None) -> bool:
+    """一括登録で安全に処理できる状態かを返す。"""
+    return status in BULK_REGISTRATION_STATUSES
+
+
 @dataclass(frozen=True)
 class FileHashResult:
     """単体計算の成功・失敗と、計算時点のファイル状態。"""

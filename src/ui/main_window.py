@@ -6,7 +6,7 @@ import os
 import random
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QSize, QTimer, Qt, QUrl
+from PySide6.QtCore import QSettings, QSize, QThread, QTimer, Qt, QUrl
 from PySide6.QtGui import (
     QActionGroup,
     QColor,
@@ -36,6 +36,7 @@ from metadata.media_finder import (
     find_media_files,
 )
 from storage.database import DatabaseError, MetadataDatabase
+from storage.file_hash import HashStatus, is_bulk_registration_status
 from storage.data_management import (
     DataManagementError,
     backup_database,
@@ -54,6 +55,25 @@ from ui.file_list_pane import (
     LANDSCAPE_VIEW,
     THUMBNAIL_VIEW,
     FileListPane,
+)
+from ui.file_identity_dialogs import (
+    AUTO_IMAGES_ONLY,
+    AUTO_OFF,
+    AUTO_REGISTRATION_KEY,
+    IMAGE_SUFFIXES,
+    VIDEO_SUFFIXES,
+    AutoRegistrationSettingsDialog,
+    BulkRegistrationDialog,
+    FileIdentityRegistrationWorker,
+    IdentityStatusDialog,
+    RegistrationProgress,
+    RegistrationProgressDialog,
+    RegistrationSummary,
+    automatic_image_candidates,
+    can_register_status,
+    can_reregister_status,
+    normalized_auto_registration_mode,
+    requires_large_registration_confirmation,
 )
 from ui.decorations import (
     status_pixmap,
@@ -236,6 +256,15 @@ class MainWindow(QMainWindow):
         self._current_folder: Path | None = None
         self._current_path: Path | None = None
         self._data_operation_in_progress = False
+        self._identity_auto_mode = normalized_auto_registration_mode(
+            self.settings.value(AUTO_REGISTRATION_KEY, AUTO_IMAGES_ONLY)
+        )
+        self._identity_thread: QThread | None = None
+        self._identity_worker: FileIdentityRegistrationWorker | None = None
+        self._identity_progress_dialog: RegistrationProgressDialog | None = None
+        self._identity_processing_paths: set[str] = set()
+        self._identity_exit_pending = False
+        self._identity_operation_automatic = False
         self._ignore_next_file_signal = False
         self._rating_prompted_paths: set[str] = set()
         self._rating_appeal_path_key = ""
@@ -435,6 +464,21 @@ class MainWindow(QMainWindow):
             "METAMIデータを復元…"
         )
         data_menu.addSeparator()
+        identity_menu = data_menu.addMenu("ファイル識別情報")
+        self.identity_menu = identity_menu
+        self.identity_settings_action = identity_menu.addAction("登録の設定…")
+        identity_menu.addSeparator()
+        self.identity_register_action = identity_menu.addAction(
+            "選択中のファイルを登録"
+        )
+        self.identity_reregister_action = identity_menu.addAction(
+            "選択中のファイルを再登録"
+        )
+        self.identity_bulk_action = identity_menu.addAction(
+            "フォルダ内の未登録項目を登録…"
+        )
+        self.identity_status_action = identity_menu.addAction("登録状況…")
+        data_menu.addSeparator()
         self.open_data_location_action = data_menu.addAction(
             "データ保存場所を開く"
         )
@@ -444,6 +488,11 @@ class MainWindow(QMainWindow):
         data_actions = (
             self.backup_data_action,
             self.restore_data_action,
+            self.identity_settings_action,
+            self.identity_register_action,
+            self.identity_reregister_action,
+            self.identity_bulk_action,
+            self.identity_status_action,
             self.open_data_location_action,
             self.database_info_action,
         )
@@ -451,12 +500,28 @@ class MainWindow(QMainWindow):
             action.setEnabled(self.database is not None)
         self.backup_data_action.triggered.connect(self._backup_metami_data)
         self.restore_data_action.triggered.connect(self._restore_metami_data)
+        self.identity_settings_action.triggered.connect(
+            self._show_identity_registration_settings
+        )
+        self.identity_register_action.triggered.connect(
+            self._register_selected_identity
+        )
+        self.identity_reregister_action.triggered.connect(
+            self._reregister_selected_identity
+        )
+        self.identity_bulk_action.triggered.connect(
+            self._register_folder_identities
+        )
+        self.identity_status_action.triggered.connect(
+            self._show_identity_status
+        )
         self.open_data_location_action.triggered.connect(
             self._open_data_location
         )
         self.database_info_action.triggered.connect(
             self._show_database_info
         )
+        self._update_identity_actions()
         help_menu = self.menuBar().addMenu("ヘルプ(&H)")
         self.help_menu = help_menu
         about = help_menu.addAction("METAMIについて")
@@ -505,7 +570,7 @@ class MainWindow(QMainWindow):
 
     def _show_version(self) -> None:
         QMessageBox.information(
-            self, "バージョン情報", "METAMI Ver1.0.8"
+            self, "バージョン情報", "METAMI Ver1.0.9"
         )
 
     def _show_ltx_video_tips(self) -> None:
@@ -1015,9 +1080,10 @@ class MainWindow(QMainWindow):
         memos_by_path: dict[str, str] = {}
         titles_by_path: dict[str, str] = {}
         missing_paths: set[str] = set()
+        newly_registered: list[Path] = []
         if self.database is not None:
             try:
-                self.database.register_files(paths)
+                newly_registered = self.database.register_files(paths)
                 missing_states = self.database.check_registered_files()
                 if source_directory is not None and include_registered_missing:
                     known_paths = self.database.get_registered_paths_in_directory(
@@ -1081,7 +1147,287 @@ class MainWindow(QMainWindow):
                 f"ユーザー情報DBへの保存をスキップしました: {database_message}",
                 "error",
             )
+        elif newly_registered:
+            self._maybe_auto_register_identities(newly_registered)
         return display_paths
+
+    def _show_identity_registration_settings(self) -> None:
+        dialog = AutoRegistrationSettingsDialog(self._identity_auto_mode, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._save_identity_auto_mode(dialog.selected_mode())
+        label = (
+            "新しく登録した画像を自動登録"
+            if self._identity_auto_mode == AUTO_IMAGES_ONLY
+            else "自動登録しない"
+        )
+        self._set_status(f"ファイル識別情報の設定を保存しました: {label}", "active")
+
+    def _save_identity_auto_mode(self, mode: str) -> None:
+        self._identity_auto_mode = normalized_auto_registration_mode(mode)
+        self.settings.setValue(AUTO_REGISTRATION_KEY, self._identity_auto_mode)
+        self.settings.sync()
+
+    def _current_identity_status(self) -> HashStatus | None:
+        if self.database is None or self._current_path is None:
+            return None
+        try:
+            self.database.refresh_file_hash_status(self._current_path)
+            stored = self.database.get_file_hash(self._current_path)
+        except DatabaseError:
+            return None
+        return stored.status if stored is not None else None
+
+    def _update_identity_actions(self) -> None:
+        if not hasattr(self, "identity_register_action"):
+            return
+        status = self._current_identity_status()
+        available = (
+            self.database is not None
+            and self._current_path is not None
+            and self._current_path.is_file()
+            and self._identity_thread is None
+        )
+        self.identity_register_action.setEnabled(
+            available and can_register_status(status)
+        )
+        self.identity_reregister_action.setEnabled(
+            available and can_reregister_status(status)
+        )
+        self.identity_bulk_action.setEnabled(
+            self.database is not None
+            and self._current_folder is not None
+            and self._identity_thread is None
+        )
+        self.identity_settings_action.setEnabled(self.database is not None)
+        self.identity_status_action.setEnabled(self.database is not None)
+
+    def _register_selected_identity(self) -> None:
+        path = self._current_path
+        if path is None or not can_register_status(self._current_identity_status()):
+            return
+        self._start_identity_registration([path], "画像" if path.suffix.lower() in IMAGE_SUFFIXES else "動画")
+
+    def _reregister_selected_identity(self) -> None:
+        path = self._current_path
+        if path is None or not can_reregister_status(self._current_identity_status()):
+            return
+        self._start_identity_registration([path], "画像" if path.suffix.lower() in IMAGE_SUFFIXES else "動画")
+
+    def _register_folder_identities(self) -> None:
+        if self.database is None or self._current_folder is None:
+            return
+        dialog = BulkRegistrationDialog(self._include_subfolders, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        options = dialog.options()
+        try:
+            found = find_media_files(
+                self._current_folder,
+                include_subfolders=options.include_subfolders,
+            )
+            self.database.refresh_file_hash_statuses(found.paths)
+            stored = self.database.get_file_hashes(found.paths)
+        except (MediaSearchError, DatabaseError) as error:
+            self._show_data_management_error(str(error))
+            return
+        suffixes = (
+            IMAGE_SUFFIXES if options.kinds == "images" else
+            VIDEO_SUFFIXES if options.kinds == "videos" else
+            IMAGE_SUFFIXES | VIDEO_SUFFIXES
+        )
+        targets = [
+            path for path in found.paths
+            if path.suffix.lower() in suffixes
+            and (record := stored.get(self._path_key(path))) is not None
+            and is_bulk_registration_status(record.status)
+        ]
+        total_size = sum(self._safe_file_size(path) for path in targets)
+        if not targets:
+            QMessageBox.information(
+                self, "ファイル識別情報", "選択した条件に該当する項目はありません。"
+            )
+            return
+        kind_label = {
+            "images": "画像", "videos": "動画", "both": "画像と動画"
+        }[options.kinds]
+        answer = QMessageBox.question(
+            self,
+            "ファイル識別情報を登録",
+            f"対象: {kind_label} {len(targets)}件\n"
+            f"合計サイズ: {self._format_file_size(total_size)}\n\n"
+            "未登録・再登録が必要・前回登録に失敗した項目が対象です。\n\n"
+            "登録を開始しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._start_identity_registration(targets, kind_label, show_progress=True)
+
+    def _show_identity_status(self) -> None:
+        if self.database is None:
+            return
+        try:
+            info = get_database_info(self.database.path)
+        except DataManagementError as error:
+            self._show_data_management_error(str(error))
+            return
+        IdentityStatusDialog(
+            info,
+            self,
+            info_provider=lambda: get_database_info(self.database.path),
+            is_processing=lambda: self._identity_thread is not None,
+        ).exec()
+
+    def _maybe_auto_register_identities(self, paths: list[Path]) -> None:
+        targets = automatic_image_candidates(paths, self._identity_auto_mode)
+        if not targets:
+            return
+        if requires_large_registration_confirmation(len(targets)):
+            box = QMessageBox(self)
+            box.setWindowTitle("ファイル識別情報を登録")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText(f"新しい画像が {len(targets)}件 見つかりました。")
+            box.setInformativeText(
+                "ファイル識別情報を登録しますか？\n\n"
+                "登録には時間がかかる場合があります。\n"
+                "新しい画像は、登録しない場合でも通常どおり一覧へ追加されます。"
+            )
+            register = box.addButton("登録する", QMessageBox.ButtonRole.AcceptRole)
+            skip = box.addButton("今回は登録しない", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(skip)
+            box.setEscapeButton(skip)
+            box.exec()
+            if box.clickedButton() is not register:
+                QMessageBox.information(
+                    self,
+                    "ファイル識別情報",
+                    "今回はファイル識別情報を登録しませんでした。\n"
+                    "新しい画像は通常どおり一覧へ登録されていますが、\n"
+                    "ファイル識別情報は未登録です。\n"
+                    "後から「データ管理」→「ファイル識別情報」から\n"
+                    "手動で登録できます。",
+                )
+                return
+        self._start_identity_registration(
+            targets, "画像", show_progress=len(targets) >= 500, automatic=True
+        )
+
+    def _start_identity_registration(
+        self,
+        paths: list[Path],
+        kinds: str,
+        *,
+        show_progress: bool = False,
+        automatic: bool = False,
+    ) -> None:
+        if self.database is None or self._identity_thread is not None:
+            self._set_status("ファイル識別情報の登録はすでに実行中です。", "error")
+            return
+        unique = [
+            path for path in dict.fromkeys(Path(path) for path in paths)
+            if self._path_key(path) not in self._identity_processing_paths
+        ]
+        if not unique:
+            return
+        self._identity_processing_paths.update(self._path_key(path) for path in unique)
+        self._identity_operation_automatic = automatic
+        thread = QThread(self)
+        worker = FileIdentityRegistrationWorker(self.database.path, unique)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._identity_progress)
+        worker.finished.connect(self._identity_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._identity_thread_finished)
+        self._identity_thread = thread
+        self._identity_worker = worker
+        if show_progress:
+            progress = RegistrationProgressDialog(len(unique), kinds, self)
+            progress.cancelRequested.connect(lambda: worker.request_cancel())
+            self._identity_progress_dialog = progress
+            progress.show()
+        self._set_status(
+            f"ファイル識別情報を登録しています… 0 / {len(unique)}", "active"
+        )
+        self._update_identity_actions()
+        thread.start()
+
+    def _identity_progress(self, progress: RegistrationProgress) -> None:
+        if self._identity_progress_dialog is not None:
+            self._identity_progress_dialog.update_progress(progress)
+        self._set_status(
+            f"ファイル識別情報を登録しています… "
+            f"{progress.completed} / {progress.total}",
+            "active",
+        )
+
+    def _identity_finished(self, summary: RegistrationSummary) -> None:
+        if self._identity_progress_dialog is not None:
+            self._identity_progress_dialog.hide()
+            self._identity_progress_dialog.deleteLater()
+            self._identity_progress_dialog = None
+        elapsed = self._format_elapsed(summary.elapsed_seconds)
+        if summary.cancelled:
+            heading = "ファイル識別情報の登録を中止しました。"
+            text = (
+                f"{heading}\n\n登録済み: {summary.succeeded}件\n"
+                f"登録失敗: {summary.failed}件\n未処理: {summary.unprocessed}件\n\n"
+                "完了済みの登録情報は保存されています。"
+            )
+        else:
+            heading = "ファイル識別情報の登録が完了しました。"
+            text = (
+                f"{heading}\n\n対象: {summary.total}件\n登録済み: {summary.succeeded}件\n"
+                f"登録失敗: {summary.failed}件\n処理時間: {elapsed}"
+            )
+        if summary.errors:
+            text += "\n\n失敗内容:\n" + "\n".join(summary.errors[:10])
+        if (
+            not self._identity_exit_pending
+            and (
+                not self._identity_operation_automatic
+                or summary.cancelled
+                or summary.failed
+            )
+        ):
+            QMessageBox.information(self, "ファイル識別情報", text)
+        self._set_status(heading, "error" if summary.failed else "active")
+        self._identity_processing_paths.clear()
+        self._update_identity_actions()
+
+    def _identity_thread_finished(self) -> None:
+        self._identity_thread = None
+        self._identity_worker = None
+        self._identity_operation_automatic = False
+        self._update_identity_actions()
+        if self._identity_exit_pending:
+            self._identity_exit_pending = False
+            QTimer.singleShot(0, self.close)
+
+    @staticmethod
+    def _safe_file_size(path: Path) -> int:
+        try:
+            return max(0, path.stat().st_size)
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _format_file_size(size: int) -> str:
+        value = float(max(0, size))
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if value < 1024 or unit == "TB":
+                return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{size} B"
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total = max(0, int(seconds))
+        return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
 
     def _save_rating(
         self, path_text: str, rating: int, previous_rating: int
@@ -1198,6 +1544,7 @@ class MainWindow(QMainWindow):
             return
         self._cancel_rating_nudge()
         self._current_path = path
+        self._update_identity_actions()
         path_key = self._path_key(path)
         if path_key != self._rating_appeal_path_key:
             self.rating_appeal.set_prompt(
@@ -1249,6 +1596,7 @@ class MainWindow(QMainWindow):
         if not self._resolve_unsaved_memo():
             return
         self._current_path = None
+        self._update_identity_actions()
         self._cancel_rating_nudge()
         self.file_list_pane.clear()
         self.preview_pane.clear("入力を受け付けられませんでした。")
@@ -1259,6 +1607,7 @@ class MainWindow(QMainWindow):
         if not self._resolve_unsaved_memo():
             return
         self._current_path = None
+        self._update_identity_actions()
         self._cancel_rating_nudge()
         self.preview_pane.clear(message)
         self.metadata_pane.clear()
@@ -1541,6 +1890,30 @@ class MainWindow(QMainWindow):
         if self._data_operation_in_progress:
             event.ignore()
             return
+        if self._identity_thread is not None and self._identity_worker is not None:
+            if not self.isVisible():
+                # 非表示のテスト用ウィンドウ等は対話不能なので安全に待機する。
+                self._identity_worker.request_cancel()
+                self._identity_thread.quit()
+                self._identity_thread.wait(5000)
+                self._identity_thread = None
+                self._identity_worker = None
+                self._identity_processing_paths.clear()
+            else:
+                answer = QMessageBox.question(
+                    self,
+                    "ファイル識別情報を登録しています",
+                    "終了すると、未処理のファイルは登録されません。\n"
+                    "完了済みの登録情報は保存されます。\n\n"
+                    "登録を中止して終了しますか？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer == QMessageBox.StandardButton.Yes:
+                    self._identity_exit_pending = True
+                    self._identity_worker.request_cancel()
+                event.ignore()
+                return
         if not self._resolve_unsaved_memo():
             event.ignore()
             return

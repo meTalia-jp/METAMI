@@ -87,6 +87,8 @@ class Ver106DataManagementTests(unittest.TestCase):
                     "METAMIデータをバックアップ…",
                     "METAMIデータを復元…",
                     "",
+                    "ファイル識別情報",
+                    "",
                     "データ保存場所を開く",
                     "データベース情報…",
                 ],

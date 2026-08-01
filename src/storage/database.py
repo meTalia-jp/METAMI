@@ -161,8 +161,8 @@ class MetadataDatabase:
         except (OSError, sqlite3.Error) as error:
             raise DatabaseError(f"データベースを初期化できません: {error}") from error
 
-    def register_files(self, paths: Iterable[Path]) -> None:
-        """原本へ書き込まず、現在のファイル識別情報だけを保存する。"""
+    def register_files(self, paths: Iterable[Path]) -> list[Path]:
+        """基本情報を保存し、今回初めてDB登録されたパスを返す。"""
         records: list[tuple[str, str, str, int, int]] = []
         for path in paths:
             try:
@@ -179,9 +179,19 @@ class MetadataDatabase:
             except OSError:
                 continue
         if not records:
-            return
+            return []
         try:
             with self._connect() as connection:
+                canonical_paths = [record[0] for record in records]
+                placeholders = ",".join("?" for _path in canonical_paths)
+                existing = {
+                    str(row[0]).casefold()
+                    for row in connection.execute(
+                        f"SELECT canonical_path FROM files "
+                        f"WHERE canonical_path IN ({placeholders})",
+                        canonical_paths,
+                    ).fetchall()
+                }
                 connection.executemany(
                     """
                     INSERT INTO files (
@@ -211,6 +221,10 @@ class MetadataDatabase:
                     """,
                     ((path, path) for path, *_rest in records),
                 )
+            return [
+                Path(path) for path in canonical_paths
+                if path.casefold() not in existing
+            ]
         except sqlite3.Error as error:
             raise DatabaseError(f"ファイル情報を保存できません: {error}") from error
 
@@ -295,6 +309,15 @@ class MetadataDatabase:
                         """,
                         (result.status.value, result.error, path),
                     )
+                elif result.status is HashStatus.FAILED:
+                    cursor = connection.execute(
+                        """
+                        UPDATE files SET
+                            hash_status = ?, hash_error = ?
+                        WHERE canonical_path = ?
+                        """,
+                        (result.status.value, result.error, path),
+                    )
                 else:
                     cursor = connection.execute(
                         """
@@ -349,6 +372,47 @@ class MetadataDatabase:
             str(row[0]), row[1], row[2], status, row[4], row[5], row[6], row[7]
         )
 
+    def get_file_hashes(self, paths: Iterable[Path]) -> dict[str, StoredFileHash]:
+        """複数パスの保存状態を、パスを変更せずまとめて返す。"""
+        canonical_paths = list(
+            dict.fromkeys(str(Path(path).resolve()) for path in paths)
+        )
+        result: dict[str, StoredFileHash] = {}
+        try:
+            with self._connect() as connection:
+                for start in range(0, len(canonical_paths), 500):
+                    batch = canonical_paths[start:start + 500]
+                    if not batch:
+                        continue
+                    placeholders = ",".join("?" for _path in batch)
+                    rows = connection.execute(
+                        f"""
+                        SELECT canonical_path, content_hash, hash_algorithm,
+                               hash_status, hash_calculated_at, hashed_file_size,
+                               hashed_modified_ns, hash_error
+                        FROM files WHERE canonical_path IN ({placeholders})
+                        """,
+                        batch,
+                    ).fetchall()
+                    for row in rows:
+                        try:
+                            status = HashStatus(str(row[3]))
+                        except ValueError:
+                            status = HashStatus.STALE
+                        if (
+                            status is HashStatus.CALCULATED
+                            and not is_valid_hash(row[1], str(row[2]))
+                        ):
+                            status = HashStatus.STALE
+                        stored = StoredFileHash(
+                            str(row[0]), row[1], row[2], status, row[4], row[5],
+                            row[6], row[7],
+                        )
+                        result[str(Path(stored.path).resolve()).casefold()] = stored
+        except sqlite3.Error as error:
+            raise DatabaseError(f"ハッシュ情報を取得できません: {error}") from error
+        return result
+
     def refresh_file_hash_status(self, path: Path) -> HashStatus:
         """サイズとmtime_nsだけでmissing・stale・現在状態を判定する。"""
         stored = self.get_file_hash(path)
@@ -393,6 +457,62 @@ class MetadataDatabase:
             except sqlite3.Error as exc:
                 raise DatabaseError(f"ハッシュ状態を更新できません: {exc}") from exc
         return status
+
+    def refresh_file_hash_statuses(
+        self, paths: Iterable[Path]
+    ) -> dict[str, HashStatus]:
+        """複数項目をサイズとmtime_nsだけで確認し、変更分だけ保存する。"""
+        candidates = [Path(path) for path in paths]
+        stored_by_path = self.get_file_hashes(candidates)
+        statuses: dict[str, HashStatus] = {}
+        updates: list[tuple[str, str | None, str]] = []
+        for path in candidates:
+            key = str(path.resolve()).casefold()
+            stored = stored_by_path.get(key)
+            if stored is None:
+                continue
+            if not path.is_file():
+                status = HashStatus.MISSING
+            else:
+                try:
+                    stat = path.stat()
+                except OSError:
+                    status = HashStatus.MISSING
+                else:
+                    if stored.status is HashStatus.MISSING:
+                        status = (
+                            HashStatus.STALE
+                            if stored.content_hash is not None
+                            else HashStatus.NOT_CALCULATED
+                        )
+                    elif stored.status is HashStatus.CALCULATED and (
+                        stored.file_size != stat.st_size
+                        or stored.modified_ns != stat.st_mtime_ns
+                        or not is_valid_hash(
+                            stored.content_hash, stored.algorithm or ""
+                        )
+                    ):
+                        status = HashStatus.STALE
+                    else:
+                        status = stored.status
+            statuses[key] = status
+            if status is not stored.status:
+                error = (
+                    "登録された場所にファイルが見つかりません。"
+                    if status is HashStatus.MISSING else None
+                )
+                updates.append((status.value, error, str(path.resolve())))
+        if updates:
+            try:
+                with self._connect() as connection:
+                    connection.executemany(
+                        "UPDATE files SET hash_status = ?, hash_error = ? "
+                        "WHERE canonical_path = ?",
+                        updates,
+                    )
+            except sqlite3.Error as error:
+                raise DatabaseError(f"ハッシュ状態を更新できません: {error}") from error
+        return statuses
 
     def find_hash_matches(
         self,
