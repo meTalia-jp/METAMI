@@ -36,7 +36,13 @@ from metadata.media_finder import (
     find_media_files,
 )
 from storage.database import DatabaseError, MetadataDatabase
-from storage.file_hash import HashStatus, is_bulk_registration_status
+from storage.file_hash import (
+    HashStatus,
+    SUPPORTED_HASH_ALGORITHMS,
+    calculate_file_hash,
+    is_bulk_registration_status,
+    is_valid_hash,
+)
 from storage.data_management import (
     DataManagementError,
     backup_database,
@@ -1722,6 +1728,7 @@ class MainWindow(QMainWindow):
             "この操作は既存のDB記録のパスを変更します。\n"
             "フォルダやドライブの自動検索、別レコードへのデータコピーは行いません。\n"
             "保存済みのタイトル、評価、タグ、メモは維持されます。\n"
+            "ファイル識別情報がある場合は、選択したファイルの内容が一致するか確認します。\n"
             "METAMIは画像・動画ファイル本体を変更しません。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -1729,7 +1736,42 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            self.database.relink_missing_file(old_path, new_path)
+            stored_hash = self.database.get_file_hash(old_path)
+            has_verifiable_hash = bool(
+                stored_hash
+                and stored_hash.status is HashStatus.MISSING
+                and stored_hash.algorithm in SUPPORTED_HASH_ALGORITHMS
+                and is_valid_hash(
+                    stored_hash.content_hash, stored_hash.algorithm or ""
+                )
+                and stored_hash.calculated_at
+                and stored_hash.file_size is not None
+                and stored_hash.modified_ns is not None
+            )
+            verified_hash = None
+            expected_content_hash = None
+            expected_hash_algorithm = None
+            if has_verifiable_hash and stored_hash is not None:
+                verified_hash = calculate_file_hash(
+                    new_path, algorithm=stored_hash.algorithm or ""
+                )
+                if not verified_hash.success:
+                    QMessageBox.warning(
+                        self,
+                        "ファイル内容を確認できません",
+                        "選択したファイルの内容を確認できませんでした。\n"
+                        "読み取り権限やドライブの接続状態を確認し、もう一度選択してください。",
+                    )
+                    return
+                expected_content_hash = stored_hash.content_hash
+                expected_hash_algorithm = stored_hash.algorithm
+            self.database.relink_missing_file(
+                old_path,
+                new_path,
+                verified_hash=verified_hash,
+                expected_content_hash=expected_content_hash,
+                expected_hash_algorithm=expected_hash_algorithm,
+            )
         except DatabaseError as error:
             self._set_database_state("error")
             QMessageBox.warning(self, "登録パスの変更に失敗しました", str(error))

@@ -20,6 +20,7 @@ from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from storage.database import DatabaseError, MetadataDatabase  # noqa: E402
+from storage.file_hash import HashStatus, calculate_file_hash  # noqa: E402
 from ui.file_list_pane import FileListPane  # noqa: E402
 
 
@@ -43,6 +44,15 @@ class MissingDatabaseTests(unittest.TestCase):
         path.unlink()
         states = self.database.check_registered_files()
         self.assertTrue(states[str(path.resolve())])
+
+    def _store_hash_then_mark_missing(self, path: Path):
+        result = calculate_file_hash(path)
+        self.assertTrue(result.success)
+        self.database.save_file_hash_result(result)
+        path.unlink()
+        self.database.check_registered_files()
+        self.database.refresh_file_hash_status(path)
+        return result
 
     def test_relink_keeps_user_information_and_path_history(self) -> None:
         old = self._create_file("old.png", b"old-original")
@@ -79,6 +89,102 @@ class MissingDatabaseTests(unittest.TestCase):
             }
         self.assertEqual(paths, {old_key, str(replacement.resolve())})
         self.assertEqual(replacement.read_bytes(), before)
+
+    def test_relink_matching_hash_updates_hash_for_new_path(self) -> None:
+        old = self._create_file("hashed-old.png", b"same-content")
+        self.database.register_files([old])
+        old_result = self._store_hash_then_mark_missing(old)
+        replacement = self._create_file("hashed-new.png", b"same-content")
+        new_result = calculate_file_hash(replacement)
+
+        self.database.relink_missing_file(
+            old, replacement, verified_hash=new_result,
+            expected_content_hash=old_result.digest,
+            expected_hash_algorithm=old_result.algorithm,
+        )
+
+        stored = self.database.get_file_hash(replacement)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.status, HashStatus.CALCULATED)
+        self.assertEqual(stored.content_hash, new_result.digest)
+        self.assertEqual(stored.file_size, new_result.file_size)
+        self.assertEqual(stored.modified_ns, new_result.modified_ns)
+        self.assertIsNone(stored.error)
+
+    def test_relink_mismatching_hash_rejects_without_db_changes(self) -> None:
+        old = self._create_file("mismatch-old.png", b"old-content")
+        self.database.register_files([old])
+        old_result = self._store_hash_then_mark_missing(old)
+        replacement = self._create_file("mismatch-new.png", b"different")
+        new_result = calculate_file_hash(replacement)
+
+        with self.assertRaisesRegex(DatabaseError, "内容が一致しません"):
+            self.database.relink_missing_file(
+                old, replacement, verified_hash=new_result,
+                expected_content_hash=old_result.digest,
+                expected_hash_algorithm=old_result.algorithm,
+            )
+
+        self.assertTrue(self.database.get_file_missing_states()[str(old.resolve())])
+        self.assertIsNone(self.database.get_file_hash(replacement))
+        self.assertEqual(self.database.get_file_hash(old).content_hash, old_result.digest)
+
+    def test_relink_without_valid_hash_resets_all_hash_fields(self) -> None:
+        old = self._create_file("invalid-old.png", b"old")
+        self.database.register_files([old])
+        with closing(sqlite3.connect(self.database.path)) as connection:
+            connection.execute(
+                """UPDATE files SET content_hash = 'invalid', hash_algorithm = 'bad',
+                   hash_status = 'missing', hash_calculated_at = 'past',
+                   hashed_file_size = 3, hashed_modified_ns = 1,
+                   hash_error = 'old error' WHERE canonical_path = ?""",
+                (str(old.resolve()),),
+            )
+            connection.commit()
+        old.unlink()
+        self.database.check_registered_files()
+        replacement = self._create_file("invalid-new.png", b"new")
+
+        self.database.relink_missing_file(old, replacement)
+
+        stored = self.database.get_file_hash(replacement)
+        self.assertEqual(stored.status, HashStatus.NOT_CALCULATED)
+        self.assertIsNone(stored.content_hash)
+        self.assertIsNone(stored.algorithm)
+        self.assertIsNone(stored.calculated_at)
+        self.assertIsNone(stored.file_size)
+        self.assertIsNone(stored.modified_ns)
+        self.assertIsNone(stored.error)
+
+    def test_relink_rejects_file_changed_after_hash_calculation(self) -> None:
+        old = self._create_file("race-old.png", b"same")
+        self.database.register_files([old])
+        old_result = self._store_hash_then_mark_missing(old)
+        replacement = self._create_file("race-new.png", b"same")
+        new_result = calculate_file_hash(replacement)
+        replacement.write_bytes(b"changed-after-calculation")
+
+        with self.assertRaisesRegex(DatabaseError, "内容確認後にファイルが変更"):
+            self.database.relink_missing_file(
+                old, replacement, verified_hash=new_result,
+                expected_content_hash=old_result.digest,
+                expected_hash_algorithm=old_result.algorithm,
+            )
+        self.assertTrue(self.database.get_file_missing_states()[str(old.resolve())])
+
+    def test_relink_rejects_target_already_registered(self) -> None:
+        old = self._create_file("duplicate-old.png", b"old")
+        replacement = self._create_file("already-registered.png", b"new")
+        self.database.register_files([old, replacement])
+        old.unlink()
+        self.database.check_registered_files()
+
+        with self.assertRaisesRegex(DatabaseError, "別のMETAMI記録として登録済み"):
+            self.database.relink_missing_file(old, replacement)
+
+        states = self.database.get_file_missing_states()
+        self.assertTrue(states[str(old.resolve())])
+        self.assertFalse(states[str(replacement.resolve())])
 
     def test_delete_removes_only_target_relations_and_preserves_tags(self) -> None:
         target = self._create_file("target.mp4", b"target-original")

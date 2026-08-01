@@ -644,18 +644,54 @@ class MetadataDatabase:
                 f"見つからないファイルの詳細を読み込めません: {error}"
             ) from error
 
-    def relink_missing_file(self, old_path: Path, new_path: Path) -> None:
-        """missing記録を選択された新パスへ付け替え、ユーザー情報を維持する。"""
+    def relink_missing_file(
+        self,
+        old_path: Path,
+        new_path: Path,
+        *,
+        verified_hash: FileHashResult | None = None,
+        expected_content_hash: str | None = None,
+        expected_hash_algorithm: str | None = None,
+    ) -> None:
+        """missing記録を新パスへ付け替え、ハッシュ情報も原子的に整合させる。"""
         try:
             stat = new_path.stat()
             if not new_path.is_file():
                 raise DatabaseError("選択されたパスはファイルではありません。")
+            if verified_hash is not None:
+                if (
+                    not verified_hash.success
+                    or verified_hash.status is not HashStatus.CALCULATED
+                    or not is_valid_hash(
+                        verified_hash.digest, verified_hash.algorithm or ""
+                    )
+                    or verified_hash.calculated_at is None
+                    or verified_hash.file_size is None
+                    or verified_hash.modified_ns is None
+                ):
+                    raise DatabaseError("選択したファイルの内容を確認できません。")
+                if (
+                    verified_hash.digest != expected_content_hash
+                    or verified_hash.algorithm != expected_hash_algorithm
+                ):
+                    raise DatabaseError(
+                        "選択したファイルは、以前登録されていたファイルと内容が一致しません。\n"
+                        "この登録項目の保存場所として設定できません。\n"
+                        "別のファイルを選択してください。"
+                    )
+                if (
+                    stat.st_size != verified_hash.file_size
+                    or stat.st_mtime_ns != verified_hash.modified_ns
+                ):
+                    raise DatabaseError("内容確認後にファイルが変更されました。もう一度選択してください。")
             old_canonical = str(old_path.resolve())
             new_canonical = str(new_path.resolve())
             with self._connect() as connection:
                 row = connection.execute(
                     """
-                    SELECT id FROM files
+                    SELECT id, content_hash, hash_algorithm, hash_status,
+                           hash_calculated_at, hashed_file_size, hashed_modified_ns
+                    FROM files
                     WHERE canonical_path = ? AND missing = 1
                     """,
                     (old_canonical,),
@@ -673,22 +709,56 @@ class MetadataDatabase:
                     raise DatabaseError(
                         "選択されたファイルは別のMETAMI記録として登録済みです。"
                     )
+                current_stat = new_path.stat()
+                if verified_hash is not None:
+                    if (
+                        row[1] != expected_content_hash
+                        or row[2] != expected_hash_algorithm
+                        or str(row[3]) != HashStatus.MISSING.value
+                        or not row[4]
+                        or row[5] is None
+                        or row[6] is None
+                        or not is_valid_hash(row[1], str(row[2]))
+                    ):
+                        raise DatabaseError("保存済みのファイル識別情報が変更されています。")
+                    if (
+                        current_stat.st_size != verified_hash.file_size
+                        or current_stat.st_mtime_ns != verified_hash.modified_ns
+                    ):
+                        raise DatabaseError(
+                            "内容確認後にファイルが変更されました。もう一度選択してください。"
+                        )
+                    hash_values = (
+                        verified_hash.digest,
+                        verified_hash.algorithm,
+                        HashStatus.CALCULATED.value,
+                        verified_hash.calculated_at,
+                        verified_hash.file_size,
+                        verified_hash.modified_ns,
+                        None,
+                    )
+                else:
+                    hash_values = (
+                        None, None, HashStatus.NOT_CALCULATED.value,
+                        None, None, None, None,
+                    )
                 connection.execute(
                     """
                     UPDATE files
                     SET canonical_path = ?, filename = ?, format_name = ?,
                         size_bytes = ?, modified_ns = ?, missing = 0,
+                        content_hash = ?, hash_algorithm = ?, hash_status = ?,
+                        hash_calculated_at = ?, hashed_file_size = ?,
+                        hashed_modified_ns = ?, hash_error = ?,
                         last_checked_at = CURRENT_TIMESTAMP,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (
-                        new_canonical,
-                        new_path.name,
+                        new_canonical, new_path.name,
                         new_path.suffix.removeprefix(".").casefold(),
-                        stat.st_size,
-                        stat.st_mtime_ns,
-                        file_id,
+                        current_stat.st_size, current_stat.st_mtime_ns,
+                        *hash_values, file_id,
                     ),
                 )
                 connection.execute(
