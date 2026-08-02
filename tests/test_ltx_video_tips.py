@@ -109,7 +109,12 @@ class LtxVideoTipsTests(unittest.TestCase):
         try:
             self.assertEqual(
                 [action.text() for action in window.help_menu.actions()],
-                ["METAMIについて", "バージョン情報", "作成メモ"],
+                [
+                    "METAMIについて",
+                    "バージョン情報",
+                    "作成メモ",
+                    "METAMIデータのバックアップと復元",
+                ],
             )
             actions = window.creation_notes_menu.actions()
             self.assertEqual(

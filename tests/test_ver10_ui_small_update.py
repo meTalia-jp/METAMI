@@ -139,7 +139,12 @@ class Ver10UiSmallUpdateTests(unittest.TestCase):
             ]
             self.assertEqual(
                 help_actions,
-                ["METAMIについて", "バージョン情報", "作成メモ"],
+                [
+                    "METAMIについて",
+                    "バージョン情報",
+                    "作成メモ",
+                    "METAMIデータのバックアップと復元",
+                ],
             )
             self.assertEqual(
                 [

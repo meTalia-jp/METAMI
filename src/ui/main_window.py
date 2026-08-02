@@ -6,10 +6,11 @@ import os
 import random
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, QSize, QTimer, Qt
+from PySide6.QtCore import QSettings, QSize, QThread, QTimer, Qt, QUrl
 from PySide6.QtGui import (
     QActionGroup,
     QColor,
+    QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
     QPainter,
@@ -35,10 +36,50 @@ from metadata.media_finder import (
     find_media_files,
 )
 from storage.database import DatabaseError, MetadataDatabase
+from storage.file_hash import (
+    HashStatus,
+    SUPPORTED_HASH_ALGORITHMS,
+    calculate_file_hash,
+    is_bulk_registration_status,
+    is_valid_hash,
+)
+from storage.data_management import (
+    DataManagementError,
+    backup_database,
+    get_database_info,
+    restore_database,
+    timestamped_database_name,
+    validate_metami_database,
+    validate_restore_source,
+    with_database_suffix,
+)
+from ui.data_management_dialog import (
+    DatabaseInfoDialog,
+    DataManagementHelpDialog,
+)
 from ui.file_list_pane import (
     LANDSCAPE_VIEW,
     THUMBNAIL_VIEW,
     FileListPane,
+)
+from ui.file_identity_dialogs import (
+    AUTO_IMAGES_ONLY,
+    AUTO_OFF,
+    AUTO_REGISTRATION_KEY,
+    IMAGE_SUFFIXES,
+    VIDEO_SUFFIXES,
+    AutoRegistrationSettingsDialog,
+    BulkRegistrationDialog,
+    FileIdentityRegistrationWorker,
+    IdentityStatusDialog,
+    RegistrationProgress,
+    RegistrationProgressDialog,
+    RegistrationSummary,
+    automatic_image_candidates,
+    can_register_status,
+    can_reregister_status,
+    normalized_auto_registration_mode,
+    requires_large_registration_confirmation,
 )
 from ui.decorations import (
     status_pixmap,
@@ -47,6 +88,16 @@ from ui.metadata_pane import MetadataPane
 from ui.missing_items_dialog import MissingItemsDialog
 from ui.ltx_video_tips_dialog import LtxVideoTipsDialog
 from ui.preview_pane import PreviewPane
+from ui.reuse_candidates_dialog import (
+    ReuseCandidateDetectionWorker,
+    ReuseCandidatesDialog,
+    UserDataCopyProgressDialog,
+    UserDataCopyResultDialog,
+    UserDataCopyWorker,
+)
+from storage.user_data_candidate_detection import detect_reuse_candidates
+from storage.user_data_candidate_detection import ReuseCandidateResult
+from storage.user_data_reuse import CopyDecision
 from ui.surface_widgets import (
     AnalysisCharacterHeader,
     AnalysisConsolePanel,
@@ -220,6 +271,31 @@ class MainWindow(QMainWindow):
         )
         self._current_folder: Path | None = None
         self._current_path: Path | None = None
+        self._current_display_paths: tuple[Path, ...] = ()
+        self._data_operation_in_progress = False
+        self._identity_auto_mode = normalized_auto_registration_mode(
+            self.settings.value(AUTO_REGISTRATION_KEY, AUTO_IMAGES_ONLY)
+        )
+        self._identity_thread: QThread | None = None
+        self._identity_worker: FileIdentityRegistrationWorker | None = None
+        self._identity_progress_dialog: RegistrationProgressDialog | None = None
+        self._identity_processing_paths: set[str] = set()
+        self._identity_exit_pending = False
+        self._identity_operation_automatic = False
+        self._identity_successful_file_ids: tuple[int, ...] = ()
+        self._reuse_detection_thread: QThread | None = None
+        self._reuse_detection_worker: ReuseCandidateDetectionWorker | None = None
+        self._reuse_notified_keys: set[tuple] = set()
+        self._reuse_notification: QMessageBox | None = None
+        self._reuse_candidates_dialog: ReuseCandidatesDialog | None = None
+        self._reuse_exit_pending = False
+        self._reuse_detection_stale = False
+        self._reuse_pending_target_ids: set[int] = set()
+        self._copy_thread: QThread | None = None
+        self._copy_worker: UserDataCopyWorker | None = None
+        self._copy_progress_dialog: UserDataCopyProgressDialog | None = None
+        self._copy_result_dialog: UserDataCopyResultDialog | None = None
+        self._copy_exit_pending = False
         self._ignore_next_file_signal = False
         self._rating_prompted_paths: set[str] = set()
         self._rating_appeal_path_key = ""
@@ -410,6 +486,73 @@ class MainWindow(QMainWindow):
         tab_settings.triggered.connect(self._show_display_tab_settings)
         reset_tabs = view_menu.addAction("表示を初期状態に戻す")
         reset_tabs.triggered.connect(self._reset_display_layout)
+        data_menu = self.menuBar().addMenu("データ管理(&D)")
+        self.data_menu = data_menu
+        self.backup_data_action = data_menu.addAction(
+            "METAMIデータをバックアップ…"
+        )
+        self.restore_data_action = data_menu.addAction(
+            "METAMIデータを復元…"
+        )
+        data_menu.addSeparator()
+        identity_menu = data_menu.addMenu("ファイル識別情報")
+        self.identity_menu = identity_menu
+        self.identity_settings_action = identity_menu.addAction("登録の設定…")
+        identity_menu.addSeparator()
+        self.identity_register_action = identity_menu.addAction(
+            "選択中のファイルを登録"
+        )
+        self.identity_reregister_action = identity_menu.addAction(
+            "選択中のファイルを再登録"
+        )
+        self.identity_bulk_action = identity_menu.addAction(
+            "フォルダ内の未登録項目を登録…"
+        )
+        self.identity_status_action = identity_menu.addAction("登録状況…")
+        data_menu.addSeparator()
+        self.open_data_location_action = data_menu.addAction(
+            "データ保存場所を開く"
+        )
+        self.database_info_action = data_menu.addAction(
+            "データベース情報…"
+        )
+        data_actions = (
+            self.backup_data_action,
+            self.restore_data_action,
+            self.identity_settings_action,
+            self.identity_register_action,
+            self.identity_reregister_action,
+            self.identity_bulk_action,
+            self.identity_status_action,
+            self.open_data_location_action,
+            self.database_info_action,
+        )
+        for action in data_actions:
+            action.setEnabled(self.database is not None)
+        self.backup_data_action.triggered.connect(self._backup_metami_data)
+        self.restore_data_action.triggered.connect(self._restore_metami_data)
+        self.identity_settings_action.triggered.connect(
+            self._show_identity_registration_settings
+        )
+        self.identity_register_action.triggered.connect(
+            self._register_selected_identity
+        )
+        self.identity_reregister_action.triggered.connect(
+            self._reregister_selected_identity
+        )
+        self.identity_bulk_action.triggered.connect(
+            self._register_folder_identities
+        )
+        self.identity_status_action.triggered.connect(
+            self._show_identity_status
+        )
+        self.open_data_location_action.triggered.connect(
+            self._open_data_location
+        )
+        self.database_info_action.triggered.connect(
+            self._show_database_info
+        )
+        self._update_identity_actions()
         help_menu = self.menuBar().addMenu("ヘルプ(&H)")
         self.help_menu = help_menu
         about = help_menu.addAction("METAMIについて")
@@ -420,6 +563,10 @@ class MainWindow(QMainWindow):
         self.creation_notes_menu = creation_notes
         ltx_video_tips = creation_notes.addAction("LTX動画作成メモ")
         ltx_video_tips.triggered.connect(self._show_ltx_video_tips)
+        data_help = help_menu.addAction(
+            "METAMIデータのバックアップと復元"
+        )
+        data_help.triggered.connect(self._show_data_management_help)
 
     def _show_display_tab_settings(self) -> None:
         dialog = DisplayTabSettingsDialog(
@@ -454,12 +601,245 @@ class MainWindow(QMainWindow):
 
     def _show_version(self) -> None:
         QMessageBox.information(
-            self, "バージョン情報", "METAMI Ver1.0.5"
+            self,
+            "バージョン情報",
+            "METAMI Ver1.1.0\n\n"
+            "同じ内容のファイルに登録された以前のMETAMIデータを確認し、\n"
+            "現在のフォルダへ一括コピーできるようになりました。",
         )
 
     def _show_ltx_video_tips(self) -> None:
         dialog = LtxVideoTipsDialog(self)
         dialog.exec()
+
+    def _show_data_management_help(self) -> None:
+        dialog = DataManagementHelpDialog(self)
+        dialog.exec()
+
+    def _backup_metami_data(self) -> None:
+        database = self.database
+        if database is None:
+            self._show_data_management_error(
+                "METAMIデータを利用できないため、バックアップできません。"
+            )
+            return
+        QMessageBox.information(
+            self,
+            "METAMIデータのバックアップ",
+            "METAMIデータには、タイトル、星評価、タグ、メモなどの\n"
+            "登録情報が保存されています。\n\n"
+            "画像・動画ファイル本体はバックアップ対象に含まれません。",
+        )
+        selected, _filter = QFileDialog.getSaveFileName(
+            self,
+            "METAMIデータのバックアップ先を選択",
+            timestamped_database_name(),
+            "METAMIデータベース (*.db);;すべてのファイル (*.*)",
+        )
+        if not selected:
+            return
+        destination = with_database_suffix(Path(selected))
+        self._set_status("METAMIデータを確認しています…", "active")
+        self._set_data_operation_active(True)
+        try:
+            self._set_status("バックアップを作成しています…", "active")
+            saved_path = backup_database(database.path, destination)
+        except DataManagementError as error:
+            self._set_status("バックアップを作成できませんでした", "error")
+            QMessageBox.warning(
+                self,
+                "バックアップに失敗しました",
+                "METAMIデータのバックアップ作成に失敗しました。\n\n"
+                f"保存先:\n{destination}\n\n"
+                "元のMETAMIデータは変更されていません。\n\n"
+                f"詳細:\n{error}",
+            )
+            return
+        finally:
+            self._set_data_operation_active(False)
+        self._set_status("バックアップが完了しました", "active")
+        QMessageBox.information(
+            self,
+            "バックアップ完了",
+            "METAMIデータのバックアップを作成しました。\n\n"
+            f"保存先:\n{saved_path}\n\n"
+            "このバックアップには、タイトル、評価、タグ、メモなどの\n"
+            "METAMI登録情報が含まれます。\n"
+            "画像・動画ファイル本体は含まれません。",
+        )
+
+    def _restore_metami_data(self) -> None:
+        database = self.database
+        if database is None:
+            self._show_data_management_error(
+                "METAMIデータを利用できないため、復元できません。"
+            )
+            return
+        if not self._resolve_unsaved_memo():
+            return
+        selected, _filter = QFileDialog.getOpenFileName(
+            self,
+            "復元するMETAMIデータを選択",
+            "",
+            "METAMIデータベース (*.db);;すべてのファイル (*.*)",
+        )
+        if not selected:
+            return
+        source = Path(selected)
+        self._set_status("復元元を確認しています…", "active")
+        try:
+            validate_restore_source(source, database.path)
+        except DataManagementError as error:
+            self._set_status("復元元を確認できませんでした", "error")
+            QMessageBox.warning(
+                self,
+                "復元できません",
+                "選択したファイルは、METAMIデータとして確認できませんでした。\n"
+                "復元は行われていません。\n\n"
+                f"詳細:\n{error}",
+            )
+            return
+        if not self._confirm_database_restore():
+            self._set_status("復元をキャンセルしました", "ready")
+            return
+
+        selected_path = self._current_path
+        self._set_data_operation_active(True)
+        try:
+            self._set_status("復元前データを退避しています…", "active")
+            self._set_status("METAMIデータを復元しています…", "active")
+            result = restore_database(source, database.path)
+        except DataManagementError as error:
+            try:
+                validate_metami_database(database.path)
+            except DataManagementError:
+                self._set_database_state("error")
+            else:
+                self._set_database_state("online")
+            self._set_status("METAMIデータを復元できませんでした", "error")
+            QMessageBox.warning(
+                self,
+                "復元に失敗しました",
+                f"{error}\n\n画像・動画ファイル本体は変更されていません。",
+            )
+            return
+        finally:
+            self._set_data_operation_active(False)
+
+        self._set_database_state("online")
+        self._reload_after_database_restore(selected_path)
+        self._set_status("復元が完了しました", "active")
+        QMessageBox.information(
+            self,
+            "復元完了",
+            "METAMIデータを復元しました。\n\n"
+            f"復元元:\n{result.source_path}\n\n"
+            f"復元前のデータ:\n{result.before_restore_path}\n\n"
+            "画像・動画ファイル本体は変更されていません。",
+        )
+
+    def _confirm_database_restore(self) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle("METAMIデータの復元")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText("METAMIデータを復元します。")
+        box.setInformativeText(
+            "現在のタイトル、星評価、タグ、メモなどの登録情報は、\n"
+            "選択したバックアップの内容に置き換わります。\n\n"
+            "画像・動画ファイル本体は変更されません。\n\n"
+            "復元前に、現在のMETAMIデータを自動的に退避します。\n"
+            "復元後は一覧と詳細表示を更新します。\n\n"
+            "続行しますか？"
+        )
+        restore_button = box.addButton(
+            "復元する", QMessageBox.ButtonRole.AcceptRole
+        )
+        cancel_button = box.addButton(
+            "キャンセル", QMessageBox.ButtonRole.RejectRole
+        )
+        box.setDefaultButton(cancel_button)
+        box.setEscapeButton(cancel_button)
+        box.exec()
+        return box.clickedButton() is restore_button
+
+    def _reload_after_database_restore(
+        self, selected_path: Path | None
+    ) -> None:
+        if self._current_folder is not None:
+            folder = self._current_folder
+            if self._open_folder(
+                folder,
+                add_to_history=False,
+                resolve_unsaved=False,
+                select_first=False,
+            ):
+                if (
+                    selected_path is not None
+                    and self.file_list_pane.select_path(selected_path)
+                ):
+                    return
+            self._current_path = None
+            self.preview_pane.clear("ファイルを選択してください。")
+            self.metadata_pane.clear()
+            return
+        if selected_path is not None and selected_path.is_file():
+            self._set_paths([selected_path], select_first=False)
+            if self.file_list_pane.select_path(selected_path):
+                return
+        self._current_path = None
+        self.file_list_pane.clear()
+        self.preview_pane.clear("ファイルを選択してください。")
+        self.metadata_pane.clear()
+
+    def _open_data_location(self) -> None:
+        database = self.database
+        if database is None:
+            self._show_data_management_error(
+                "METAMIデータの保存場所を確認できません。"
+            )
+            return
+        folder = database.path.parent
+        if not folder.exists() or not folder.is_dir():
+            self._show_data_management_error(
+                "METAMIデータの保存フォルダが見つかりません。"
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve()))):
+            self._show_data_management_error(
+                "METAMIデータの保存場所を開けませんでした。"
+            )
+
+    def _show_database_info(self) -> None:
+        database = self.database
+        if database is None:
+            self._show_data_management_error(
+                "データベース情報を確認できません。"
+            )
+            return
+        self._set_status("METAMIデータを確認しています…", "active")
+        try:
+            info = get_database_info(database.path)
+        except DataManagementError as error:
+            self._show_data_management_error(str(error))
+            return
+        self._set_status("データベース情報を確認しました", "ready")
+        dialog = DatabaseInfoDialog(info, self)
+        dialog.exec()
+
+    def _set_data_operation_active(self, active: bool) -> None:
+        self._data_operation_in_progress = active
+        enabled = self.database is not None and not active
+        for action in (
+            self.backup_data_action,
+            self.restore_data_action,
+            self.open_data_location_action,
+            self.database_info_action,
+        ):
+            action.setEnabled(enabled)
+
+    def _show_data_management_error(self, message: str) -> None:
+        self._set_status(message, "error")
+        QMessageBox.warning(self, "データ管理", message)
 
     def _show_missing_items(self) -> None:
         if self.database is None:
@@ -735,9 +1115,10 @@ class MainWindow(QMainWindow):
         memos_by_path: dict[str, str] = {}
         titles_by_path: dict[str, str] = {}
         missing_paths: set[str] = set()
+        newly_registered: list[Path] = []
         if self.database is not None:
             try:
-                self.database.register_files(paths)
+                newly_registered = self.database.register_files(paths)
                 missing_states = self.database.check_registered_files()
                 if source_directory is not None and include_registered_missing:
                     known_paths = self.database.get_registered_paths_in_directory(
@@ -796,12 +1177,527 @@ class MainWindow(QMainWindow):
             titles_by_path=titles_by_path,
             missing_paths=missing_paths,
         )
+        self._current_display_paths = tuple(display_paths)
         if database_message:
             self._set_status(
                 f"ユーザー情報DBへの保存をスキップしました: {database_message}",
                 "error",
             )
+        elif newly_registered:
+            self._maybe_auto_register_identities(newly_registered)
         return display_paths
+
+    def _show_identity_registration_settings(self) -> None:
+        dialog = AutoRegistrationSettingsDialog(self._identity_auto_mode, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._save_identity_auto_mode(dialog.selected_mode())
+        label = (
+            "新しく登録した画像を自動登録"
+            if self._identity_auto_mode == AUTO_IMAGES_ONLY
+            else "自動登録しない"
+        )
+        self._set_status(f"ファイル識別情報の設定を保存しました: {label}", "active")
+
+    def _save_identity_auto_mode(self, mode: str) -> None:
+        self._identity_auto_mode = normalized_auto_registration_mode(mode)
+        self.settings.setValue(AUTO_REGISTRATION_KEY, self._identity_auto_mode)
+        self.settings.sync()
+
+    def _current_identity_status(self) -> HashStatus | None:
+        if self.database is None or self._current_path is None:
+            return None
+        try:
+            self.database.refresh_file_hash_status(self._current_path)
+            stored = self.database.get_file_hash(self._current_path)
+        except DatabaseError:
+            return None
+        return stored.status if stored is not None else None
+
+    def _update_identity_actions(self) -> None:
+        if not hasattr(self, "identity_register_action"):
+            return
+        status = self._current_identity_status()
+        available = (
+            self.database is not None
+            and self._current_path is not None
+            and self._current_path.is_file()
+            and self._identity_thread is None
+        )
+        self.identity_register_action.setEnabled(
+            available and can_register_status(status)
+        )
+        self.identity_reregister_action.setEnabled(
+            available and can_reregister_status(status)
+        )
+        self.identity_bulk_action.setEnabled(
+            self.database is not None
+            and self._current_folder is not None
+            and self._identity_thread is None
+        )
+        self.identity_settings_action.setEnabled(self.database is not None)
+        self.identity_status_action.setEnabled(self.database is not None)
+
+    def _register_selected_identity(self) -> None:
+        path = self._current_path
+        if path is None or not can_register_status(self._current_identity_status()):
+            return
+        self._start_identity_registration([path], "画像" if path.suffix.lower() in IMAGE_SUFFIXES else "動画")
+
+    def _reregister_selected_identity(self) -> None:
+        path = self._current_path
+        if path is None or not can_reregister_status(self._current_identity_status()):
+            return
+        self._start_identity_registration([path], "画像" if path.suffix.lower() in IMAGE_SUFFIXES else "動画")
+
+    def _register_folder_identities(self) -> None:
+        if self.database is None or self._current_folder is None:
+            return
+        dialog = BulkRegistrationDialog(self._include_subfolders, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        options = dialog.options()
+        try:
+            found = find_media_files(
+                self._current_folder,
+                include_subfolders=options.include_subfolders,
+            )
+            self.database.refresh_file_hash_statuses(found.paths)
+            stored = self.database.get_file_hashes(found.paths)
+        except (MediaSearchError, DatabaseError) as error:
+            self._show_data_management_error(str(error))
+            return
+        suffixes = (
+            IMAGE_SUFFIXES if options.kinds == "images" else
+            VIDEO_SUFFIXES if options.kinds == "videos" else
+            IMAGE_SUFFIXES | VIDEO_SUFFIXES
+        )
+        targets = [
+            path for path in found.paths
+            if path.suffix.lower() in suffixes
+            and (record := stored.get(self._path_key(path))) is not None
+            and is_bulk_registration_status(record.status)
+        ]
+        total_size = sum(self._safe_file_size(path) for path in targets)
+        if not targets:
+            QMessageBox.information(
+                self, "ファイル識別情報", "選択した条件に該当する項目はありません。"
+            )
+            return
+        kind_label = {
+            "images": "画像", "videos": "動画", "both": "画像と動画"
+        }[options.kinds]
+        answer = QMessageBox.question(
+            self,
+            "ファイル識別情報を登録",
+            f"対象: {kind_label} {len(targets)}件\n"
+            f"合計サイズ: {self._format_file_size(total_size)}\n\n"
+            "未登録・再登録が必要・前回登録に失敗した項目が対象です。\n\n"
+            "登録を開始しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._start_identity_registration(targets, kind_label, show_progress=True)
+
+    def _show_identity_status(self) -> None:
+        if self.database is None:
+            return
+        try:
+            info = get_database_info(self.database.path)
+        except DataManagementError as error:
+            self._show_data_management_error(str(error))
+            return
+        IdentityStatusDialog(
+            info,
+            self,
+            info_provider=lambda: get_database_info(self.database.path),
+            is_processing=lambda: self._identity_thread is not None,
+        ).exec()
+
+    def _maybe_auto_register_identities(self, paths: list[Path]) -> None:
+        targets = automatic_image_candidates(paths, self._identity_auto_mode)
+        if not targets:
+            return
+        if requires_large_registration_confirmation(len(targets)):
+            box = QMessageBox(self)
+            box.setWindowTitle("ファイル識別情報を登録")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText(f"新しい画像が {len(targets)}件 見つかりました。")
+            box.setInformativeText(
+                "ファイル識別情報を登録しますか？\n\n"
+                "登録には時間がかかる場合があります。\n"
+                "新しい画像は、登録しない場合でも通常どおり一覧へ追加されます。"
+            )
+            register = box.addButton("登録する", QMessageBox.ButtonRole.AcceptRole)
+            skip = box.addButton("今回は登録しない", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(skip)
+            box.setEscapeButton(skip)
+            box.exec()
+            if box.clickedButton() is not register:
+                QMessageBox.information(
+                    self,
+                    "ファイル識別情報",
+                    "今回はファイル識別情報を登録しませんでした。\n"
+                    "新しい画像は通常どおり一覧へ登録されていますが、\n"
+                    "ファイル識別情報は未登録です。\n"
+                    "後から「データ管理」→「ファイル識別情報」から\n"
+                    "手動で登録できます。",
+                )
+                return
+        self._start_identity_registration(
+            targets, "画像", show_progress=len(targets) >= 500, automatic=True
+        )
+
+    def _start_identity_registration(
+        self,
+        paths: list[Path],
+        kinds: str,
+        *,
+        show_progress: bool = False,
+        automatic: bool = False,
+    ) -> None:
+        if (
+            self.database is None
+            or self._identity_thread is not None
+        ):
+            self._set_status("ファイル識別情報の登録はすでに実行中です。", "error")
+            return
+        unique = [
+            path for path in dict.fromkeys(Path(path) for path in paths)
+            if self._path_key(path) not in self._identity_processing_paths
+        ]
+        if not unique:
+            return
+        self._identity_processing_paths.update(self._path_key(path) for path in unique)
+        self._identity_operation_automatic = automatic
+        self._identity_successful_file_ids = ()
+        if self._reuse_detection_thread is not None:
+            # 独立読取workerは完走させるが、登録開始前の古い結果は通知しない。
+            self._reuse_detection_stale = True
+        thread = QThread(self)
+        worker = FileIdentityRegistrationWorker(self.database.path, unique)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._identity_progress)
+        worker.finished.connect(self._identity_finished)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._identity_thread_finished)
+        self._identity_thread = thread
+        self._identity_worker = worker
+        if show_progress:
+            progress = RegistrationProgressDialog(len(unique), kinds, self)
+            progress.cancelRequested.connect(lambda: worker.request_cancel())
+            self._identity_progress_dialog = progress
+            progress.show()
+        self._set_status(
+            f"ファイル識別情報を登録しています… 0 / {len(unique)}", "active"
+        )
+        self._update_identity_actions()
+        thread.start()
+
+    def _identity_progress(self, progress: RegistrationProgress) -> None:
+        if self._identity_progress_dialog is not None:
+            self._identity_progress_dialog.update_progress(progress)
+        self._set_status(
+            f"ファイル識別情報を登録しています… "
+            f"{progress.completed} / {progress.total}",
+            "active",
+        )
+
+    def _identity_finished(self, summary: RegistrationSummary) -> None:
+        self._identity_successful_file_ids = summary.successful_file_ids
+        if self._identity_progress_dialog is not None:
+            self._identity_progress_dialog.hide()
+            self._identity_progress_dialog.deleteLater()
+            self._identity_progress_dialog = None
+        elapsed = self._format_elapsed(summary.elapsed_seconds)
+        if summary.cancelled:
+            heading = "ファイル識別情報の登録を中止しました。"
+            text = (
+                f"{heading}\n\n登録済み: {summary.succeeded}件\n"
+                f"登録失敗: {summary.failed}件\n未処理: {summary.unprocessed}件\n\n"
+                "完了済みの登録情報は保存されています。"
+            )
+        else:
+            heading = "ファイル識別情報の登録が完了しました。"
+            text = (
+                f"{heading}\n\n対象: {summary.total}件\n登録済み: {summary.succeeded}件\n"
+                f"登録失敗: {summary.failed}件\n処理時間: {elapsed}"
+            )
+        if summary.errors:
+            text += "\n\n失敗内容:\n" + "\n".join(summary.errors[:10])
+        if (
+            not self._identity_exit_pending
+            and (
+                not self._identity_operation_automatic
+                or summary.cancelled
+                or summary.failed
+            )
+        ):
+            QMessageBox.information(self, "ファイル識別情報", text)
+        self._set_status(heading, "error" if summary.failed else "active")
+        self._identity_processing_paths.clear()
+        self._update_identity_actions()
+        # 成功IDを保持した後に終了させ、thread.finished側が先行して
+        # 候補検出対象を取りこぼさないようにする。
+        if self._identity_thread is not None:
+            self._identity_thread.quit()
+
+    def _identity_thread_finished(self) -> None:
+        successful_file_ids = self._identity_successful_file_ids
+        self._identity_successful_file_ids = ()
+        self._identity_thread = None
+        self._identity_worker = None
+        self._identity_operation_automatic = False
+        self._update_identity_actions()
+        if self._identity_exit_pending:
+            self._identity_exit_pending = False
+            QTimer.singleShot(0, self.close)
+            return
+        if successful_file_ids:
+            QTimer.singleShot(
+                0, lambda ids=successful_file_ids: self._start_reuse_detection(ids)
+            )
+
+    def _start_reuse_detection(self, target_file_ids: tuple[int, ...]) -> None:
+        if (
+            self.database is None
+            or not target_file_ids
+            or self._identity_thread is not None
+        ):
+            if target_file_ids:
+                self._reuse_pending_target_ids.update(target_file_ids)
+            return
+        if self._reuse_detection_thread is not None:
+            self._reuse_pending_target_ids.update(target_file_ids)
+            return
+        self._reuse_detection_stale = False
+        thread = QThread(self)
+        worker = ReuseCandidateDetectionWorker(self.database.path, target_file_ids)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._reuse_detection_finished)
+        worker.failed.connect(self._reuse_detection_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._reuse_detection_thread_finished)
+        self._reuse_detection_thread = thread
+        self._reuse_detection_worker = worker
+        thread.start()
+
+    def _reuse_detection_finished(
+        self, results: tuple[ReuseCandidateResult, ...]
+    ) -> None:
+        if self._reuse_detection_stale:
+            return
+        new_results = tuple(
+            result for result in results
+            if result.notification_key not in self._reuse_notified_keys
+        )
+        available = tuple(
+            result for result in new_results
+            if result.assessment.decision is CopyDecision.COPYABLE
+        )
+        if not available or self._identity_exit_pending or self._reuse_exit_pending:
+            return
+        self._reuse_notified_keys.update(
+            result.notification_key for result in new_results
+        )
+        self._show_reuse_notification(new_results, len(available))
+
+    def _reuse_detection_failed(self, _message: str) -> None:
+        if self._reuse_exit_pending:
+            return
+        self._set_status(
+            "以前のMETAMIデータ候補を確認できませんでした。", "ready"
+        )
+
+    def _reuse_detection_thread_finished(self) -> None:
+        self._reuse_detection_thread = None
+        self._reuse_detection_worker = None
+        self._reuse_detection_stale = False
+        self._update_identity_actions()
+        if self._reuse_exit_pending:
+            self._reuse_exit_pending = False
+            QTimer.singleShot(0, self.close)
+            return
+        if self._reuse_pending_target_ids and self._identity_thread is None:
+            pending = tuple(sorted(self._reuse_pending_target_ids))
+            self._reuse_pending_target_ids.clear()
+            QTimer.singleShot(0, lambda ids=pending: self._start_reuse_detection(ids))
+
+    def _show_reuse_notification(
+        self, results: tuple[ReuseCandidateResult, ...], available_count: int
+    ) -> None:
+        if self._reuse_notification is not None:
+            self._reuse_notification.close()
+        box = QMessageBox(self)
+        box.setWindowTitle("以前のMETAMIデータ")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(
+            "以前のMETAMIデータを利用できるファイルが\n"
+            f"{available_count}件見つかりました。"
+        )
+        confirm = box.addButton("確認する", QMessageBox.ButtonRole.AcceptRole)
+        ignore = box.addButton("今回は何もしない", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(confirm)
+        box.setEscapeButton(ignore)
+        box.setModal(False)
+        box.finished.connect(
+            lambda _code, values=results, button=confirm, notice=box:
+            self._reuse_notification_closed(values, button, notice)
+        )
+        self._reuse_notification = box
+        box.show()
+
+    def _reuse_notification_closed(
+        self,
+        results: tuple[ReuseCandidateResult, ...],
+        confirm_button: QAbstractButton,
+        notice: QMessageBox,
+    ) -> None:
+        clicked = notice.clickedButton()
+        if self._reuse_notification is notice:
+            self._reuse_notification = None
+        if clicked is confirm_button:
+            dialog = ReuseCandidatesDialog(results, self)
+            self._reuse_candidates_dialog = dialog
+            dialog.batchCopyRequested.connect(self._request_batch_user_data_copy)
+            dialog.finished.connect(
+                lambda _code, value=dialog: self._clear_reuse_dialog(value)
+            )
+            dialog.show()
+
+    def _clear_reuse_dialog(self, dialog: ReuseCandidatesDialog) -> None:
+        if self._reuse_candidates_dialog is dialog:
+            self._reuse_candidates_dialog = None
+
+    def _request_batch_user_data_copy(self) -> None:
+        if self.database is None or self._current_folder is None:
+            self._set_status("現在開いているフォルダがありません。", "error")
+            return
+        if self._identity_thread is not None or self._reuse_detection_thread is not None or self._copy_thread is not None:
+            self._set_status("別のファイル処理が実行中です。", "error")
+            return
+        paths = tuple(self._current_display_paths)
+        try:
+            target_ids = self.database.get_file_ids_by_paths(paths)
+            current = detect_reuse_candidates(self.database, target_ids)
+        except DatabaseError as error:
+            self._set_status(f"コピー候補を再確認できません: {error}", "error")
+            return
+        count = sum(item.assessment.decision is CopyDecision.COPYABLE for item in current)
+        if not count:
+            QMessageBox.information(
+                self, "以前のMETAMIデータを一括コピー",
+                "現在のフォルダにコピー可能なファイルはありません。",
+            )
+            return
+        message = (
+            f"現在のフォルダで、以前のMETAMIデータを利用できるファイルが{count}件あります。\n\n"
+            "メモ・タグ・星評価・利用者タイトルをまとめてコピーします。\n"
+            "すでにMETAMIデータがあるファイルや、候補が競合するファイルは変更されません。"
+        )
+        confirmation = QMessageBox(self)
+        confirmation.setWindowTitle("以前のMETAMIデータを一括コピー")
+        confirmation.setIcon(QMessageBox.Icon.Question)
+        confirmation.setText(message)
+        execute = confirmation.addButton(
+            f"{count}件へ一括コピー", QMessageBox.ButtonRole.AcceptRole
+        )
+        cancel = confirmation.addButton(
+            "キャンセル", QMessageBox.ButtonRole.RejectRole
+        )
+        confirmation.setDefaultButton(cancel)
+        confirmation.exec()
+        if confirmation.clickedButton() is not execute:
+            return
+        self._start_batch_user_data_copy(tuple(target_ids), paths)
+
+    def _start_batch_user_data_copy(
+        self, target_ids: tuple[int, ...], allowed_paths: tuple[Path, ...]
+    ) -> None:
+        if self.database is None or self._copy_thread is not None:
+            return
+        thread = QThread(self)
+        worker = UserDataCopyWorker(self.database.path, target_ids, allowed_paths)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._copy_progress)
+        worker.finished.connect(self._copy_finished)
+        worker.failed.connect(self._copy_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._copy_thread_finished)
+        self._copy_thread = thread
+        self._copy_worker = worker
+        progress = UserDataCopyProgressDialog(len(target_ids), self)
+        progress.cancelRequested.connect(worker.request_cancel)
+        self._copy_progress_dialog = progress
+        if self._reuse_candidates_dialog is not None:
+            self._reuse_candidates_dialog.close()
+        progress.show()
+        thread.start()
+
+    def _copy_progress(self, done: int, total: int, path: str) -> None:
+        if self._copy_progress_dialog is not None:
+            self._copy_progress_dialog.update_progress(done, total, path)
+
+    def _copy_finished(self, summary) -> None:
+        if self._copy_progress_dialog is not None:
+            self._copy_progress_dialog.hide()
+            self._copy_progress_dialog.deleteLater()
+            self._copy_progress_dialog = None
+        if summary.copied_count and self._current_folder is not None:
+            self._reload_current_folder()
+        dialog = UserDataCopyResultDialog(summary, self)
+        self._copy_result_dialog = dialog
+        dialog.finished.connect(lambda _code: setattr(self, "_copy_result_dialog", None))
+        dialog.show()
+
+    def _copy_failed(self, message: str) -> None:
+        if self._copy_progress_dialog is not None:
+            self._copy_progress_dialog.hide()
+            self._copy_progress_dialog.deleteLater()
+            self._copy_progress_dialog = None
+        QMessageBox.warning(self, "以前のMETAMIデータを一括コピー", f"処理を完了できませんでした。\n{message}")
+
+    def _copy_thread_finished(self) -> None:
+        self._copy_thread = None
+        self._copy_worker = None
+        if self._copy_exit_pending:
+            self._copy_exit_pending = False
+            QTimer.singleShot(0, self.close)
+
+    @staticmethod
+    def _safe_file_size(path: Path) -> int:
+        try:
+            return max(0, path.stat().st_size)
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _format_file_size(size: int) -> str:
+        value = float(max(0, size))
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if value < 1024 or unit == "TB":
+                return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{size} B"
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total = max(0, int(seconds))
+        return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
 
     def _save_rating(
         self, path_text: str, rating: int, previous_rating: int
@@ -918,6 +1814,7 @@ class MainWindow(QMainWindow):
             return
         self._cancel_rating_nudge()
         self._current_path = path
+        self._update_identity_actions()
         path_key = self._path_key(path)
         if path_key != self._rating_appeal_path_key:
             self.rating_appeal.set_prompt(
@@ -945,10 +1842,10 @@ class MainWindow(QMainWindow):
         if not path.is_file():
             self._refresh_missing_preview()
             self.metadata_pane.show_error(
-                "登録済みの原本ファイルが見つかりません。"
+                "登録された場所にファイルが見つかりません。"
             )
             self._set_status(
-                f"原本ファイルが見つかりません: {path}", "error"
+                f"登録された場所にファイルが見つかりません: {path}", "error"
             )
             return
         self.preview_pane.show_file(path)
@@ -969,6 +1866,7 @@ class MainWindow(QMainWindow):
         if not self._resolve_unsaved_memo():
             return
         self._current_path = None
+        self._update_identity_actions()
         self._cancel_rating_nudge()
         self.file_list_pane.clear()
         self.preview_pane.clear("入力を受け付けられませんでした。")
@@ -979,6 +1877,7 @@ class MainWindow(QMainWindow):
         if not self._resolve_unsaved_memo():
             return
         self._current_path = None
+        self._update_identity_actions()
         self._cancel_rating_nudge()
         self.preview_pane.clear(message)
         self.metadata_pane.clear()
@@ -1048,7 +1947,7 @@ class MainWindow(QMainWindow):
             details = self.database.get_missing_file_details(path)
         except DatabaseError as error:
             self._set_database_state("error")
-            self.preview_pane.clear("原本ファイルが見つかりません。")
+            self.preview_pane.clear("登録された場所にファイルが見つかりません。")
             self._set_status(f"missing記録を読み込めません: {error}", "error")
             return
         self.preview_pane.show_missing(
@@ -1061,16 +1960,16 @@ class MainWindow(QMainWindow):
         )
 
     def _locate_missing_file(self) -> None:
-        """ユーザーが選んだ代替ファイルへ、同じDB記録を付け替える。"""
+        """利用者が選んだファイルへ、既存DB記録の登録パスを変更する。"""
         old_path = self._current_path
         if old_path is None or old_path.is_file() or self.database is None:
-            self._set_status("関連付け対象のmissing記録がありません。", "error")
+            self._set_status("登録パスを変更するmissing記録がありません。", "error")
             return
         if not self._resolve_unsaved_memo():
             return
         selected, _ = QFileDialog.getOpenFileName(
             self,
-            "代替ファイルを選択",
+            "新しい登録先ファイルを選択",
             "",
             "対応ファイル (*.png *.webp *.jpg *.jpeg *.JPG *.JPEG *.mp4);;"
             "すべてのファイル (*)",
@@ -1081,28 +1980,66 @@ class MainWindow(QMainWindow):
         if not new_path.is_file() or new_path.suffix.lower() not in SUPPORTED_SUFFIXES:
             QMessageBox.warning(
                 self,
-                "ファイルを関連付けできません",
+                "登録パスを変更できません",
                 "PNG、WEBP、MP4の実在するファイルを選択してください。",
             )
             return
         answer = QMessageBox.question(
             self,
-            "新しいパスへ関連付け",
-            "次のファイルを、見つからない記録の新しい原本として関連付けますか？\n\n"
-            f"以前: {old_path}\n新しいファイル: {new_path}\n\n"
+            "登録パスを変更",
+            "見つからない記録の登録パスを、次のファイルへ変更しますか？\n\n"
+            f"現在の登録パス: {old_path}\n新しい登録先: {new_path}\n\n"
+            "この操作は既存のDB記録のパスを変更します。\n"
+            "フォルダやドライブの自動検索、別レコードへのデータコピーは行いません。\n"
             "保存済みのタイトル、評価、タグ、メモは維持されます。\n"
-            "METAMIは原本ファイルを変更しません。",
+            "ファイル識別情報がある場合は、選択したファイルの内容が一致するか確認します。\n"
+            "METAMIは画像・動画ファイル本体を変更しません。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            self.database.relink_missing_file(old_path, new_path)
+            stored_hash = self.database.get_file_hash(old_path)
+            has_verifiable_hash = bool(
+                stored_hash
+                and stored_hash.status is HashStatus.MISSING
+                and stored_hash.algorithm in SUPPORTED_HASH_ALGORITHMS
+                and is_valid_hash(
+                    stored_hash.content_hash, stored_hash.algorithm or ""
+                )
+                and stored_hash.calculated_at
+                and stored_hash.file_size is not None
+                and stored_hash.modified_ns is not None
+            )
+            verified_hash = None
+            expected_content_hash = None
+            expected_hash_algorithm = None
+            if has_verifiable_hash and stored_hash is not None:
+                verified_hash = calculate_file_hash(
+                    new_path, algorithm=stored_hash.algorithm or ""
+                )
+                if not verified_hash.success:
+                    QMessageBox.warning(
+                        self,
+                        "ファイル内容を確認できません",
+                        "選択したファイルの内容を確認できませんでした。\n"
+                        "読み取り権限やドライブの接続状態を確認し、もう一度選択してください。",
+                    )
+                    return
+                expected_content_hash = stored_hash.content_hash
+                expected_hash_algorithm = stored_hash.algorithm
+            self.database.relink_missing_file(
+                old_path,
+                new_path,
+                verified_hash=verified_hash,
+                expected_content_hash=expected_content_hash,
+                expected_hash_algorithm=expected_hash_algorithm,
+            )
         except DatabaseError as error:
             self._set_database_state("error")
-            QMessageBox.warning(self, "関連付けに失敗しました", str(error))
-            self._set_status(f"新しいパスへ関連付けできません: {error}", "error")
+            QMessageBox.warning(self, "登録パスの変更に失敗しました", str(error))
+            self._set_status(f"登録パスを変更できません: {error}", "error")
             return
         paths = [
             new_path if self._same_path(path, old_path) else path
@@ -1112,7 +2049,7 @@ class MainWindow(QMainWindow):
         self._set_database_state("online")
         self._set_paths(paths)
         self.file_list_pane.select_path(new_path)
-        self._set_status(f"新しいパスへ関連付けました: {new_path}", "active")
+        self._set_status(f"登録パスを変更しました: {new_path}", "active")
 
     def _delete_missing_record(self) -> None:
         """missing記録だけを、明示確認後にトランザクションで削除する。"""
@@ -1258,6 +2195,59 @@ class MainWindow(QMainWindow):
         self.rating_appeal.clear_nudge()
 
     def closeEvent(self, event) -> None:
+        if self._data_operation_in_progress:
+            event.ignore()
+            return
+        if self._copy_thread is not None and self._copy_worker is not None:
+            if not self.isVisible():
+                self._copy_worker.request_cancel()
+                self._copy_thread.quit()
+                self._copy_thread.wait(5000)
+                self._copy_thread = None
+                self._copy_worker = None
+            else:
+                self._copy_exit_pending = True
+                self._copy_worker.request_cancel()
+                self._set_status("コピー処理の中止後に終了します。", "ready")
+                event.ignore()
+                return
+        if self._identity_thread is not None and self._identity_worker is not None:
+            if not self.isVisible():
+                # 非表示のテスト用ウィンドウ等は対話不能なので安全に待機する。
+                self._identity_worker.request_cancel()
+                self._identity_thread.quit()
+                self._identity_thread.wait(5000)
+                self._identity_thread = None
+                self._identity_worker = None
+                self._identity_processing_paths.clear()
+            else:
+                answer = QMessageBox.question(
+                    self,
+                    "ファイル識別情報を登録しています",
+                    "終了すると、未処理のファイルは登録されません。\n"
+                    "完了済みの登録情報は保存されます。\n\n"
+                    "登録を中止して終了しますか？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer == QMessageBox.StandardButton.Yes:
+                    self._identity_exit_pending = True
+                    self._identity_worker.request_cancel()
+                event.ignore()
+                return
+        if self._reuse_detection_thread is not None:
+            if not self.isVisible():
+                self._reuse_detection_thread.quit()
+                self._reuse_detection_thread.wait(5000)
+                self._reuse_detection_thread = None
+                self._reuse_detection_worker = None
+            else:
+                self._reuse_exit_pending = True
+                self._set_status(
+                    "以前のMETAMIデータ候補の確認終了後に閉じます。", "ready"
+                )
+                event.ignore()
+                return
         if not self._resolve_unsaved_memo():
             event.ignore()
             return
