@@ -17,6 +17,7 @@ from storage.file_hash import (
 )
 from storage.migrations.v1_to_v2 import ensure_hash_columns
 from storage.schema_version import METAMI_SCHEMA_VERSION
+from storage.user_data_reuse import FileHashRecord, FileUserData
 
 
 # 既存の内部テーブル初期化・移行処理用。中央DB全体の互換性番号とは別。
@@ -540,6 +541,97 @@ class MetadataDatabase:
         except sqlite3.Error as error:
             raise DatabaseError(f"ハッシュ候補を検索できません: {error}") from error
         return [str(row[0]) for row in rows]
+
+    def find_file_records_by_hash(
+        self,
+        digest: str,
+        *,
+        algorithm: str = CURRENT_HASH_ALGORITHM,
+        statuses: tuple[HashStatus, ...] = (HashStatus.CALCULATED,),
+        exclude_file_id: int | None = None,
+    ) -> list[FileHashRecord]:
+        """同一ハッシュのfiles情報を安定した順序で読み取り専用取得する。"""
+        if not is_valid_hash(digest, algorithm) or not statuses:
+            return []
+        allowed = tuple(dict.fromkeys(status.value for status in statuses))
+        placeholders = ",".join("?" for _status in allowed)
+        excluded_sql = " AND id <> ?" if exclude_file_id is not None else ""
+        parameters: tuple[object, ...] = (digest, algorithm, *allowed)
+        if exclude_file_id is not None:
+            parameters += (exclude_file_id,)
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT id, canonical_path, format_name, missing,
+                           content_hash, hash_algorithm, hash_status,
+                           hash_calculated_at, hashed_file_size,
+                           hashed_modified_ns, hash_error
+                    FROM files
+                    WHERE content_hash = ? AND hash_algorithm = ?
+                      AND hash_status IN ({placeholders}){excluded_sql}
+                    ORDER BY canonical_path COLLATE NOCASE, id
+                    """,
+                    parameters,
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise DatabaseError(f"ハッシュ候補情報を取得できません: {error}") from error
+        return [
+            FileHashRecord(
+                file_id=int(row[0]),
+                canonical_path=str(row[1]),
+                format_name=str(row[2]),
+                missing=bool(row[3]),
+                content_hash=row[4],
+                hash_algorithm=row[5],
+                hash_status=HashStatus(str(row[6])),
+                hash_calculated_at=row[7],
+                hashed_file_size=row[8],
+                hashed_modified_ns=row[9],
+                hash_error=row[10],
+            )
+            for row in rows
+        ]
+
+    def get_file_user_data(self, file_id: int) -> FileUserData:
+        """file_idの保存済み利用者データを返す。存在しなければ空DTO。"""
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT COALESCE(user_info.memo, ''),
+                           COALESCE(user_info.rating, 0),
+                           COALESCE(user_info.title, '')
+                    FROM files
+                    LEFT JOIN user_info ON user_info.file_id = files.id
+                    WHERE files.id = ?
+                    """,
+                    (file_id,),
+                ).fetchone()
+                tag_rows = connection.execute(
+                    """
+                    SELECT tags.name
+                    FROM file_tags
+                    JOIN tags ON tags.id = file_tags.tag_id
+                    WHERE file_tags.file_id = ? AND TRIM(tags.name) <> ''
+                    ORDER BY tags.name COLLATE NOCASE, tags.name
+                    """,
+                    (file_id,),
+                ).fetchall()
+        except sqlite3.Error as error:
+            raise DatabaseError(f"利用者データを読み込めません: {error}") from error
+        if row is None:
+            return FileUserData()
+        return FileUserData(
+            memo=str(row[0] or ""),
+            rating=int(row[1] or 0),
+            title=str(row[2] or ""),
+            tags=tuple(str(tag[0]) for tag in tag_rows if str(tag[0]).strip()),
+        )
+
+    def has_file_user_data(self, file_id: int) -> bool:
+        """file_idに実質的な利用者入力があるか返す。"""
+        return self.get_file_user_data(file_id).has_data
 
     def get_file_missing_states(self) -> dict[str, bool]:
         """登録済みファイルの現在パスとmissing状態を返す。"""
