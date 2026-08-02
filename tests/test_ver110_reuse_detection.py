@@ -211,7 +211,10 @@ class ReuseDetectionTests(unittest.TestCase):
             self.assertIn("以前の登録 1", dialog.details.toPlainText())
             self.assertIn("以前の登録 2", dialog.details.toPlainText())
             button_texts = [button.text() for button in dialog.findChildren(QPushButton)]
-            self.assertEqual(button_texts, ["閉じる"])
+            self.assertEqual(
+                button_texts, ["コピー可能な0件へ一括コピー", "閉じる"]
+            )
+            self.assertFalse(dialog.copy_button.isEnabled())
             self.assertEqual(
                 dialog.table.editTriggers(),
                 dialog.table.EditTrigger.NoEditTriggers,

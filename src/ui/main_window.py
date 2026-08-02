@@ -91,7 +91,11 @@ from ui.preview_pane import PreviewPane
 from ui.reuse_candidates_dialog import (
     ReuseCandidateDetectionWorker,
     ReuseCandidatesDialog,
+    UserDataCopyProgressDialog,
+    UserDataCopyResultDialog,
+    UserDataCopyWorker,
 )
+from storage.user_data_candidate_detection import detect_reuse_candidates
 from storage.user_data_candidate_detection import ReuseCandidateResult
 from storage.user_data_reuse import CopyDecision
 from ui.surface_widgets import (
@@ -267,6 +271,7 @@ class MainWindow(QMainWindow):
         )
         self._current_folder: Path | None = None
         self._current_path: Path | None = None
+        self._current_display_paths: tuple[Path, ...] = ()
         self._data_operation_in_progress = False
         self._identity_auto_mode = normalized_auto_registration_mode(
             self.settings.value(AUTO_REGISTRATION_KEY, AUTO_IMAGES_ONLY)
@@ -286,6 +291,11 @@ class MainWindow(QMainWindow):
         self._reuse_exit_pending = False
         self._reuse_detection_stale = False
         self._reuse_pending_target_ids: set[int] = set()
+        self._copy_thread: QThread | None = None
+        self._copy_worker: UserDataCopyWorker | None = None
+        self._copy_progress_dialog: UserDataCopyProgressDialog | None = None
+        self._copy_result_dialog: UserDataCopyResultDialog | None = None
+        self._copy_exit_pending = False
         self._ignore_next_file_signal = False
         self._rating_prompted_paths: set[str] = set()
         self._rating_appeal_path_key = ""
@@ -1163,6 +1173,7 @@ class MainWindow(QMainWindow):
             titles_by_path=titles_by_path,
             missing_paths=missing_paths,
         )
+        self._current_display_paths = tuple(display_paths)
         if database_message:
             self._set_status(
                 f"ユーザー情報DBへの保存をスキップしました: {database_message}",
@@ -1553,6 +1564,7 @@ class MainWindow(QMainWindow):
         if clicked is confirm_button:
             dialog = ReuseCandidatesDialog(results, self)
             self._reuse_candidates_dialog = dialog
+            dialog.batchCopyRequested.connect(self._request_batch_user_data_copy)
             dialog.finished.connect(
                 lambda _code, value=dialog: self._clear_reuse_dialog(value)
             )
@@ -1561,6 +1573,106 @@ class MainWindow(QMainWindow):
     def _clear_reuse_dialog(self, dialog: ReuseCandidatesDialog) -> None:
         if self._reuse_candidates_dialog is dialog:
             self._reuse_candidates_dialog = None
+
+    def _request_batch_user_data_copy(self) -> None:
+        if self.database is None or self._current_folder is None:
+            self._set_status("現在開いているフォルダがありません。", "error")
+            return
+        if self._identity_thread is not None or self._reuse_detection_thread is not None or self._copy_thread is not None:
+            self._set_status("別のファイル処理が実行中です。", "error")
+            return
+        paths = tuple(self._current_display_paths)
+        try:
+            target_ids = self.database.get_file_ids_by_paths(paths)
+            current = detect_reuse_candidates(self.database, target_ids)
+        except DatabaseError as error:
+            self._set_status(f"コピー候補を再確認できません: {error}", "error")
+            return
+        count = sum(item.assessment.decision is CopyDecision.COPYABLE for item in current)
+        if not count:
+            QMessageBox.information(
+                self, "以前のMETAMIデータを一括コピー",
+                "現在のフォルダにコピー可能なファイルはありません。",
+            )
+            return
+        message = (
+            f"現在のフォルダで、以前のMETAMIデータを利用できるファイルが{count}件あります。\n\n"
+            "メモ・タグ・星評価・利用者タイトルをまとめてコピーします。\n"
+            "すでにMETAMIデータがあるファイルや、候補が競合するファイルは変更されません。"
+        )
+        confirmation = QMessageBox(self)
+        confirmation.setWindowTitle("以前のMETAMIデータを一括コピー")
+        confirmation.setIcon(QMessageBox.Icon.Question)
+        confirmation.setText(message)
+        execute = confirmation.addButton(
+            f"{count}件へ一括コピー", QMessageBox.ButtonRole.AcceptRole
+        )
+        cancel = confirmation.addButton(
+            "キャンセル", QMessageBox.ButtonRole.RejectRole
+        )
+        confirmation.setDefaultButton(cancel)
+        confirmation.exec()
+        if confirmation.clickedButton() is not execute:
+            return
+        self._start_batch_user_data_copy(tuple(target_ids), paths)
+
+    def _start_batch_user_data_copy(
+        self, target_ids: tuple[int, ...], allowed_paths: tuple[Path, ...]
+    ) -> None:
+        if self.database is None or self._copy_thread is not None:
+            return
+        thread = QThread(self)
+        worker = UserDataCopyWorker(self.database.path, target_ids, allowed_paths)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._copy_progress)
+        worker.finished.connect(self._copy_finished)
+        worker.failed.connect(self._copy_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._copy_thread_finished)
+        self._copy_thread = thread
+        self._copy_worker = worker
+        progress = UserDataCopyProgressDialog(len(target_ids), self)
+        progress.cancelRequested.connect(worker.request_cancel)
+        self._copy_progress_dialog = progress
+        if self._reuse_candidates_dialog is not None:
+            self._reuse_candidates_dialog.close()
+        progress.show()
+        thread.start()
+
+    def _copy_progress(self, done: int, total: int, path: str) -> None:
+        if self._copy_progress_dialog is not None:
+            self._copy_progress_dialog.update_progress(done, total, path)
+
+    def _copy_finished(self, summary) -> None:
+        if self._copy_progress_dialog is not None:
+            self._copy_progress_dialog.hide()
+            self._copy_progress_dialog.deleteLater()
+            self._copy_progress_dialog = None
+        if summary.copied_count and self._current_folder is not None:
+            self._reload_current_folder()
+        dialog = UserDataCopyResultDialog(summary, self)
+        self._copy_result_dialog = dialog
+        dialog.finished.connect(lambda _code: setattr(self, "_copy_result_dialog", None))
+        dialog.show()
+
+    def _copy_failed(self, message: str) -> None:
+        if self._copy_progress_dialog is not None:
+            self._copy_progress_dialog.hide()
+            self._copy_progress_dialog.deleteLater()
+            self._copy_progress_dialog = None
+        QMessageBox.warning(self, "以前のMETAMIデータを一括コピー", f"処理を完了できませんでした。\n{message}")
+
+    def _copy_thread_finished(self) -> None:
+        self._copy_thread = None
+        self._copy_worker = None
+        if self._copy_exit_pending:
+            self._copy_exit_pending = False
+            QTimer.singleShot(0, self.close)
 
     @staticmethod
     def _safe_file_size(path: Path) -> int:
@@ -2082,6 +2194,19 @@ class MainWindow(QMainWindow):
         if self._data_operation_in_progress:
             event.ignore()
             return
+        if self._copy_thread is not None and self._copy_worker is not None:
+            if not self.isVisible():
+                self._copy_worker.request_cancel()
+                self._copy_thread.quit()
+                self._copy_thread.wait(5000)
+                self._copy_thread = None
+                self._copy_worker = None
+            else:
+                self._copy_exit_pending = True
+                self._copy_worker.request_cancel()
+                self._set_status("コピー処理の中止後に終了します。", "ready")
+                event.ignore()
+                return
         if self._identity_thread is not None and self._identity_worker is not None:
             if not self.isVisible():
                 # 非表示のテスト用ウィンドウ等は対話不能なので安全に待機する。

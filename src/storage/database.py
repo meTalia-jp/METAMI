@@ -759,6 +759,85 @@ class MetadataDatabase:
             raise DatabaseError(f"利用者データを一括取得できません: {error}") from error
         return result
 
+    def copy_file_user_data_if_empty(
+        self,
+        target_file_id: int,
+        data: FileUserData,
+        *,
+        expected_algorithm: str,
+        expected_digest: str,
+    ) -> bool:
+        """targetが空かつ識別情報不変の場合だけ、1 transactionで4項目を保存する。"""
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """
+                    SELECT files.missing, files.hash_status,
+                           files.hash_algorithm, files.content_hash,
+                           COALESCE(user_info.memo, ''),
+                           COALESCE(user_info.rating, 0),
+                           COALESCE(user_info.title, ''),
+                           EXISTS(SELECT 1 FROM file_tags WHERE file_id = files.id)
+                    FROM files
+                    LEFT JOIN user_info ON user_info.file_id = files.id
+                    WHERE files.id = ?
+                    """,
+                    (int(target_file_id),),
+                ).fetchone()
+                if row is None:
+                    return False
+                unchanged = (
+                    not bool(row[0])
+                    and str(row[1]) == HashStatus.CALCULATED.value
+                    and str(row[2] or "") == expected_algorithm
+                    and str(row[3] or "") == expected_digest
+                )
+                empty = (
+                    not str(row[4] or "").strip()
+                    and int(row[5] or 0) == 0
+                    and not str(row[6] or "").strip()
+                    and not bool(row[7])
+                )
+                if not unchanged or not empty:
+                    return False
+                connection.execute(
+                    """
+                    INSERT INTO user_info (
+                        file_id, favorite, rating, title, memo, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(file_id) DO UPDATE SET
+                        favorite = excluded.favorite,
+                        rating = excluded.rating,
+                        title = excluded.title,
+                        memo = excluded.memo,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        int(target_file_id), int(data.rating > 0), int(data.rating),
+                        data.title, data.memo,
+                    ),
+                )
+                for tag in data.tags:
+                    if not tag.strip():
+                        continue
+                    connection.execute(
+                        "INSERT INTO tags (name) VALUES (?) ON CONFLICT(name) DO NOTHING",
+                        (tag,),
+                    )
+                    tag_row = connection.execute(
+                        "SELECT id FROM tags WHERE name = ? COLLATE NOCASE", (tag,)
+                    ).fetchone()
+                    if tag_row is None:
+                        raise sqlite3.IntegrityError("タグを保存できません。")
+                    connection.execute(
+                        "INSERT INTO file_tags (file_id, tag_id) VALUES (?, ?)",
+                        (int(target_file_id), int(tag_row[0])),
+                    )
+                return True
+        except sqlite3.Error as error:
+            raise DatabaseError(f"利用者データをコピーできません: {error}") from error
+
     def get_file_ids_by_paths(self, paths: Iterable[Path]) -> tuple[int, ...]:
         """登録済みパスに対応するfile_idを入力順で一括取得する。"""
         canonical = list(dict.fromkeys(str(Path(path).resolve()) for path in paths))
