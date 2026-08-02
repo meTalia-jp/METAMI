@@ -88,6 +88,12 @@ from ui.metadata_pane import MetadataPane
 from ui.missing_items_dialog import MissingItemsDialog
 from ui.ltx_video_tips_dialog import LtxVideoTipsDialog
 from ui.preview_pane import PreviewPane
+from ui.reuse_candidates_dialog import (
+    ReuseCandidateDetectionWorker,
+    ReuseCandidatesDialog,
+)
+from storage.user_data_candidate_detection import ReuseCandidateResult
+from storage.user_data_reuse import CopyDecision
 from ui.surface_widgets import (
     AnalysisCharacterHeader,
     AnalysisConsolePanel,
@@ -271,6 +277,15 @@ class MainWindow(QMainWindow):
         self._identity_processing_paths: set[str] = set()
         self._identity_exit_pending = False
         self._identity_operation_automatic = False
+        self._identity_successful_file_ids: tuple[int, ...] = ()
+        self._reuse_detection_thread: QThread | None = None
+        self._reuse_detection_worker: ReuseCandidateDetectionWorker | None = None
+        self._reuse_notified_keys: set[tuple] = set()
+        self._reuse_notification: QMessageBox | None = None
+        self._reuse_candidates_dialog: ReuseCandidatesDialog | None = None
+        self._reuse_exit_pending = False
+        self._reuse_detection_stale = False
+        self._reuse_pending_target_ids: set[int] = set()
         self._ignore_next_file_signal = False
         self._rating_prompted_paths: set[str] = set()
         self._rating_appeal_path_key = ""
@@ -1328,7 +1343,10 @@ class MainWindow(QMainWindow):
         show_progress: bool = False,
         automatic: bool = False,
     ) -> None:
-        if self.database is None or self._identity_thread is not None:
+        if (
+            self.database is None
+            or self._identity_thread is not None
+        ):
             self._set_status("ファイル識別情報の登録はすでに実行中です。", "error")
             return
         unique = [
@@ -1339,13 +1357,16 @@ class MainWindow(QMainWindow):
             return
         self._identity_processing_paths.update(self._path_key(path) for path in unique)
         self._identity_operation_automatic = automatic
+        self._identity_successful_file_ids = ()
+        if self._reuse_detection_thread is not None:
+            # 独立読取workerは完走させるが、登録開始前の古い結果は通知しない。
+            self._reuse_detection_stale = True
         thread = QThread(self)
         worker = FileIdentityRegistrationWorker(self.database.path, unique)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self._identity_progress)
         worker.finished.connect(self._identity_finished)
-        worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._identity_thread_finished)
@@ -1372,6 +1393,7 @@ class MainWindow(QMainWindow):
         )
 
     def _identity_finished(self, summary: RegistrationSummary) -> None:
+        self._identity_successful_file_ids = summary.successful_file_ids
         if self._identity_progress_dialog is not None:
             self._identity_progress_dialog.hide()
             self._identity_progress_dialog.deleteLater()
@@ -1404,8 +1426,14 @@ class MainWindow(QMainWindow):
         self._set_status(heading, "error" if summary.failed else "active")
         self._identity_processing_paths.clear()
         self._update_identity_actions()
+        # 成功IDを保持した後に終了させ、thread.finished側が先行して
+        # 候補検出対象を取りこぼさないようにする。
+        if self._identity_thread is not None:
+            self._identity_thread.quit()
 
     def _identity_thread_finished(self) -> None:
+        successful_file_ids = self._identity_successful_file_ids
+        self._identity_successful_file_ids = ()
         self._identity_thread = None
         self._identity_worker = None
         self._identity_operation_automatic = False
@@ -1413,6 +1441,126 @@ class MainWindow(QMainWindow):
         if self._identity_exit_pending:
             self._identity_exit_pending = False
             QTimer.singleShot(0, self.close)
+            return
+        if successful_file_ids:
+            QTimer.singleShot(
+                0, lambda ids=successful_file_ids: self._start_reuse_detection(ids)
+            )
+
+    def _start_reuse_detection(self, target_file_ids: tuple[int, ...]) -> None:
+        if (
+            self.database is None
+            or not target_file_ids
+            or self._identity_thread is not None
+        ):
+            if target_file_ids:
+                self._reuse_pending_target_ids.update(target_file_ids)
+            return
+        if self._reuse_detection_thread is not None:
+            self._reuse_pending_target_ids.update(target_file_ids)
+            return
+        self._reuse_detection_stale = False
+        thread = QThread(self)
+        worker = ReuseCandidateDetectionWorker(self.database.path, target_file_ids)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._reuse_detection_finished)
+        worker.failed.connect(self._reuse_detection_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._reuse_detection_thread_finished)
+        self._reuse_detection_thread = thread
+        self._reuse_detection_worker = worker
+        thread.start()
+
+    def _reuse_detection_finished(
+        self, results: tuple[ReuseCandidateResult, ...]
+    ) -> None:
+        if self._reuse_detection_stale:
+            return
+        new_results = tuple(
+            result for result in results
+            if result.notification_key not in self._reuse_notified_keys
+        )
+        available = tuple(
+            result for result in new_results
+            if result.assessment.decision is CopyDecision.COPYABLE
+        )
+        if not available or self._identity_exit_pending or self._reuse_exit_pending:
+            return
+        self._reuse_notified_keys.update(
+            result.notification_key for result in new_results
+        )
+        self._show_reuse_notification(new_results, len(available))
+
+    def _reuse_detection_failed(self, _message: str) -> None:
+        if self._reuse_exit_pending:
+            return
+        self._set_status(
+            "以前のMETAMIデータ候補を確認できませんでした。", "ready"
+        )
+
+    def _reuse_detection_thread_finished(self) -> None:
+        self._reuse_detection_thread = None
+        self._reuse_detection_worker = None
+        self._reuse_detection_stale = False
+        self._update_identity_actions()
+        if self._reuse_exit_pending:
+            self._reuse_exit_pending = False
+            QTimer.singleShot(0, self.close)
+            return
+        if self._reuse_pending_target_ids and self._identity_thread is None:
+            pending = tuple(sorted(self._reuse_pending_target_ids))
+            self._reuse_pending_target_ids.clear()
+            QTimer.singleShot(0, lambda ids=pending: self._start_reuse_detection(ids))
+
+    def _show_reuse_notification(
+        self, results: tuple[ReuseCandidateResult, ...], available_count: int
+    ) -> None:
+        if self._reuse_notification is not None:
+            self._reuse_notification.close()
+        box = QMessageBox(self)
+        box.setWindowTitle("以前のMETAMIデータ")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(
+            "以前のMETAMIデータを利用できるファイルが\n"
+            f"{available_count}件見つかりました。"
+        )
+        confirm = box.addButton("確認する", QMessageBox.ButtonRole.AcceptRole)
+        ignore = box.addButton("今回は何もしない", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(confirm)
+        box.setEscapeButton(ignore)
+        box.setModal(False)
+        box.finished.connect(
+            lambda _code, values=results, button=confirm, notice=box:
+            self._reuse_notification_closed(values, button, notice)
+        )
+        self._reuse_notification = box
+        box.show()
+
+    def _reuse_notification_closed(
+        self,
+        results: tuple[ReuseCandidateResult, ...],
+        confirm_button: QAbstractButton,
+        notice: QMessageBox,
+    ) -> None:
+        clicked = notice.clickedButton()
+        if self._reuse_notification is notice:
+            self._reuse_notification = None
+        if clicked is confirm_button:
+            dialog = ReuseCandidatesDialog(results, self)
+            self._reuse_candidates_dialog = dialog
+            dialog.finished.connect(
+                lambda _code, value=dialog: self._clear_reuse_dialog(value)
+            )
+            dialog.show()
+
+    def _clear_reuse_dialog(self, dialog: ReuseCandidatesDialog) -> None:
+        if self._reuse_candidates_dialog is dialog:
+            self._reuse_candidates_dialog = None
 
     @staticmethod
     def _safe_file_size(path: Path) -> int:
@@ -1956,6 +2104,19 @@ class MainWindow(QMainWindow):
                 if answer == QMessageBox.StandardButton.Yes:
                     self._identity_exit_pending = True
                     self._identity_worker.request_cancel()
+                event.ignore()
+                return
+        if self._reuse_detection_thread is not None:
+            if not self.isVisible():
+                self._reuse_detection_thread.quit()
+                self._reuse_detection_thread.wait(5000)
+                self._reuse_detection_thread = None
+                self._reuse_detection_worker = None
+            else:
+                self._reuse_exit_pending = True
+                self._set_status(
+                    "以前のMETAMIデータ候補の確認終了後に閉じます。", "ready"
+                )
                 event.ignore()
                 return
         if not self._resolve_unsaved_memo():

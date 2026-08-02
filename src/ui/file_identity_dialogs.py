@@ -233,6 +233,7 @@ class RegistrationSummary:
     elapsed_seconds: float
     cancelled: bool
     errors: tuple[str, ...]
+    successful_file_ids: tuple[int, ...] = ()
 
 
 class FileIdentityRegistrationWorker(QObject):
@@ -255,6 +256,7 @@ class FileIdentityRegistrationWorker(QObject):
         started = time.monotonic()
         database = MetadataDatabase(self.database_path)
         succeeded = failed = processed_bytes = 0
+        successful_paths: list[Path] = []
         errors: list[str] = []
         total_bytes = sum(_safe_size(path) for path in self.paths)
         for path in self.paths:
@@ -268,6 +270,7 @@ class FileIdentityRegistrationWorker(QObject):
                 error = str(exc)
             if result.status is HashStatus.CALCULATED and not error:
                 succeeded += 1
+                successful_paths.append(path)
             else:
                 failed += 1
                 errors.append(f"{path.name}: {error or identity_status_label(result.status)}")
@@ -279,11 +282,18 @@ class FileIdentityRegistrationWorker(QObject):
                 )
             )
         completed = succeeded + failed
+        try:
+            successful_file_ids = database.get_file_ids_by_paths(successful_paths)
+        except DatabaseError as exc:
+            successful_file_ids = ()
+            if successful_paths:
+                errors.append(f"候補確認対象を取得できません: {exc}")
         self.finished.emit(
             RegistrationSummary(
                 len(self.paths), succeeded, failed, len(self.paths) - completed,
                 processed_bytes, total_bytes, time.monotonic() - started,
                 self._cancel.is_set(), tuple(errors[:100]),
+                successful_file_ids,
             )
         )
 

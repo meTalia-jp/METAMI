@@ -593,6 +593,88 @@ class MetadataDatabase:
             for row in rows
         ]
 
+    def get_file_hash_records_by_ids(
+        self, file_ids: Iterable[int]
+    ) -> dict[int, FileHashRecord]:
+        """複数file_idのfiles・ハッシュ情報を一括で読み取る。"""
+        ids = list(dict.fromkeys(int(file_id) for file_id in file_ids))
+        if not ids:
+            return {}
+        result: dict[int, FileHashRecord] = {}
+        try:
+            with self._connect() as connection:
+                for start in range(0, len(ids), 500):
+                    batch = ids[start:start + 500]
+                    placeholders = ",".join("?" for _id in batch)
+                    rows = connection.execute(
+                        f"""
+                        SELECT id, canonical_path, format_name, missing,
+                               content_hash, hash_algorithm, hash_status,
+                               hash_calculated_at, hashed_file_size,
+                               hashed_modified_ns, hash_error
+                        FROM files WHERE id IN ({placeholders})
+                        """,
+                        batch,
+                    ).fetchall()
+                    for row in rows:
+                        record = self._file_hash_record_from_row(row)
+                        result[record.file_id] = record
+        except sqlite3.Error as error:
+            raise DatabaseError(f"ファイル識別情報を一括取得できません: {error}") from error
+        return result
+
+    def find_file_records_by_hash_keys(
+        self,
+        hash_keys: Iterable[tuple[str, str]],
+        *,
+        statuses: tuple[HashStatus, ...] = (
+            HashStatus.CALCULATED, HashStatus.MISSING,
+        ),
+    ) -> list[FileHashRecord]:
+        """複数の(algorithm, digest)候補を一括検索する。"""
+        keys = list(dict.fromkeys(
+            (algorithm, digest) for algorithm, digest in hash_keys
+            if is_valid_hash(digest, algorithm)
+        ))
+        if not keys or not statuses:
+            return []
+        allowed = tuple(dict.fromkeys(status.value for status in statuses))
+        status_placeholders = ",".join("?" for _status in allowed)
+        records: dict[int, FileHashRecord] = {}
+        try:
+            with self._connect() as connection:
+                for start in range(0, len(keys), 200):
+                    batch = keys[start:start + 200]
+                    key_sql = " OR ".join(
+                        "(hash_algorithm = ? AND content_hash = ?)" for _key in batch
+                    )
+                    parameters: list[object] = []
+                    for algorithm, digest in batch:
+                        parameters.extend((algorithm, digest))
+                    parameters.extend(allowed)
+                    rows = connection.execute(
+                        f"""
+                        SELECT id, canonical_path, format_name, missing,
+                               content_hash, hash_algorithm, hash_status,
+                               hash_calculated_at, hashed_file_size,
+                               hashed_modified_ns, hash_error
+                        FROM files
+                        WHERE ({key_sql})
+                          AND hash_status IN ({status_placeholders})
+                        ORDER BY canonical_path COLLATE NOCASE, id
+                        """,
+                        parameters,
+                    ).fetchall()
+                    for row in rows:
+                        record = self._file_hash_record_from_row(row)
+                        records[record.file_id] = record
+        except sqlite3.Error as error:
+            raise DatabaseError(f"同一ハッシュ候補を一括取得できません: {error}") from error
+        return sorted(
+            records.values(),
+            key=lambda record: (record.canonical_path.casefold(), record.file_id),
+        )
+
     def get_file_user_data(self, file_id: int) -> FileUserData:
         """file_idの保存済み利用者データを返す。存在しなければ空DTO。"""
         try:
@@ -629,9 +711,89 @@ class MetadataDatabase:
             tags=tuple(str(tag[0]) for tag in tag_rows if str(tag[0]).strip()),
         )
 
+    def get_file_user_data_many(
+        self, file_ids: Iterable[int]
+    ) -> dict[int, FileUserData]:
+        """複数file_idの利用者データを、user_infoとタグ各1回ずつで取得する。"""
+        ids = list(dict.fromkeys(int(file_id) for file_id in file_ids))
+        result = {file_id: FileUserData() for file_id in ids}
+        if not ids:
+            return result
+        try:
+            with self._connect() as connection:
+                for start in range(0, len(ids), 500):
+                    batch = ids[start:start + 500]
+                    placeholders = ",".join("?" for _id in batch)
+                    rows = connection.execute(
+                        f"""
+                        SELECT files.id, COALESCE(user_info.memo, ''),
+                               COALESCE(user_info.rating, 0),
+                               COALESCE(user_info.title, '')
+                        FROM files
+                        LEFT JOIN user_info ON user_info.file_id = files.id
+                        WHERE files.id IN ({placeholders})
+                        """,
+                        batch,
+                    ).fetchall()
+                    tags = connection.execute(
+                        f"""
+                        SELECT file_tags.file_id, tags.name
+                        FROM file_tags JOIN tags ON tags.id = file_tags.tag_id
+                        WHERE file_tags.file_id IN ({placeholders})
+                          AND TRIM(tags.name) <> ''
+                        ORDER BY tags.name COLLATE NOCASE, tags.name
+                        """,
+                        batch,
+                    ).fetchall()
+                    tags_by_id: dict[int, list[str]] = {}
+                    for file_id, name in tags:
+                        tags_by_id.setdefault(int(file_id), []).append(str(name))
+                    for row in rows:
+                        file_id = int(row[0])
+                        result[file_id] = FileUserData(
+                            memo=str(row[1] or ""), rating=int(row[2] or 0),
+                            title=str(row[3] or ""),
+                            tags=tuple(tags_by_id.get(file_id, ())),
+                        )
+        except sqlite3.Error as error:
+            raise DatabaseError(f"利用者データを一括取得できません: {error}") from error
+        return result
+
+    def get_file_ids_by_paths(self, paths: Iterable[Path]) -> tuple[int, ...]:
+        """登録済みパスに対応するfile_idを入力順で一括取得する。"""
+        canonical = list(dict.fromkeys(str(Path(path).resolve()) for path in paths))
+        if not canonical:
+            return ()
+        ids_by_path: dict[str, int] = {}
+        try:
+            with self._connect() as connection:
+                for start in range(0, len(canonical), 500):
+                    batch = canonical[start:start + 500]
+                    placeholders = ",".join("?" for _path in batch)
+                    rows = connection.execute(
+                        f"SELECT id, canonical_path FROM files "
+                        f"WHERE canonical_path IN ({placeholders})",
+                        batch,
+                    ).fetchall()
+                    ids_by_path.update((str(path), int(file_id)) for file_id, path in rows)
+        except sqlite3.Error as error:
+            raise DatabaseError(f"登録済みfile_idを取得できません: {error}") from error
+        return tuple(ids_by_path[path] for path in canonical if path in ids_by_path)
+
     def has_file_user_data(self, file_id: int) -> bool:
         """file_idに実質的な利用者入力があるか返す。"""
         return self.get_file_user_data(file_id).has_data
+
+    @staticmethod
+    def _file_hash_record_from_row(row) -> FileHashRecord:
+        return FileHashRecord(
+            file_id=int(row[0]), canonical_path=str(row[1]),
+            format_name=str(row[2]), missing=bool(row[3]),
+            content_hash=row[4], hash_algorithm=row[5],
+            hash_status=HashStatus(str(row[6])), hash_calculated_at=row[7],
+            hashed_file_size=row[8], hashed_modified_ns=row[9],
+            hash_error=row[10],
+        )
 
     def get_file_missing_states(self) -> dict[str, bool]:
         """登録済みファイルの現在パスとmissing状態を返す。"""
