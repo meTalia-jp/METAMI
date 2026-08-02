@@ -601,7 +601,11 @@ class MainWindow(QMainWindow):
 
     def _show_version(self) -> None:
         QMessageBox.information(
-            self, "バージョン情報", "METAMI Ver1.0.9"
+            self,
+            "バージョン情報",
+            "METAMI Ver1.1.0\n\n"
+            "同じ内容のファイルに登録された以前のMETAMIデータを確認し、\n"
+            "現在のフォルダへ一括コピーできるようになりました。",
         )
 
     def _show_ltx_video_tips(self) -> None:

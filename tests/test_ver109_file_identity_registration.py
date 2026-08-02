@@ -388,10 +388,12 @@ class Ver109FileIdentityRegistrationTests(unittest.TestCase):
         finally:
             self._close(window)
 
-    def test_unreleased_design_does_not_rewrite_published_changelog(self) -> None:
+    def test_ver110_release_does_not_rewrite_published_changelog(self) -> None:
         text = (ROOT / "docs" / "CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn("## Unreleased", text)
-        self.assertIn("同じ内容のファイルへのMETAMIデータコピー", text)
+        self.assertIn("## Ver1.1.0 - 2026-08-02", text)
+        self.assertIn("以前のMETAMIデータ", text)
+        self.assertIn("METAMIデータを一括コピー", text)
         self.assertIn(
             "ハッシュ一致による再関連付け、自動パス更新、重複整理、miniDBは未実装",
             text,
@@ -415,9 +417,10 @@ class Ver109FileIdentityRegistrationTests(unittest.TestCase):
             "途中でキャンセル",
             "完了済み",
             "ファイル本体は変更されません",
-            "同じ内容のファイルへの",
-            "METAMIデータのコピー",
-            "見つからないファイルを探す専用機能は未実装です",
+            "以前のMETAMIデータを利用する",
+            "コピー可能なN件へ一括コピー",
+            "既存データへの上書きには対応していません",
+            "自動同期しません",
         ):
             self.assertIn(expected, text)
 
